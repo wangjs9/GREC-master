@@ -236,13 +236,14 @@ class Generator(nn.Module):
 
 class Transformer(nn.Module):
 
-    def __init__(self, vocab, decoder_number, model_file_path=None, is_eval=False, load_optim=False):
+    def __init__(self, vocab, decoder_number, model_file_path=None, load_optim=False):
         """
         vocab: a Lang type data, which is defined in data_reader.py
         decoder_number: the number of classes
         """
         super(Transformer, self).__init__()
-        self.device = torch.device('cuda' if config.USE_CUDA else 'cpu')
+        self.iter = 0
+        self.current_loss = 1000
         self.vocab = vocab
         self.vocab_size = vocab.n_words
 
@@ -258,8 +259,6 @@ class Transformer(nn.Module):
                                filter_size=config.filter)
 
         self.decoder_key = nn.Linear(config.hidden_dim, decoder_number, bias=False)
-        if config.cause_multitask:
-            self.cause_evaluator = nn.Linear(config.hidden_dim * 2, 1, bias=False)
         self.generator = Generator(config.hidden_dim, self.vocab_size)
 
         if config.weight_sharing:
@@ -267,25 +266,35 @@ class Transformer(nn.Module):
             self.generator.proj.weight = self.embedding.lut.weight
 
         self.criterion = nn.NLLLoss(ignore_index=config.PAD_idx)
-        if (config.label_smoothing):
+        if config.label_smoothing:
             self.criterion = LabelSmoothing(size=self.vocab_size, padding_idx=config.PAD_idx, smoothing=0.1)
             self.criterion_ppl = nn.NLLLoss(ignore_index=config.PAD_idx)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=config.lr)
         if (config.noam):
-            self.optimizer = NoamOpt(config.hidden_dim, 1, 8000,
-                                     torch.optim.Adam(self.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+            optimizer = torch.optim.Adam(self.parameters(), lr=0, weight_decay=config.weight_decay, betas=(0.9, 0.98),
+                                         eps=1e-9)
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                             milestones=[config.schedule * i for i in range(4)],
+                                                             gamma=0.1)
+            self.scheduler = NoamOpt(config.hidden_dim, 1, 8000, optimizer, scheduler)
+        else:
+            self.optimizer = torch.optim.Adam(self.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer,
+                                                                  milestones=[config.schedule * i for i in range(4)],
+                                                                  gamma=0.1)
 
         if model_file_path is not None:
             print("loading weights")
             state = torch.load(model_file_path, map_location=lambda storage, location: storage)
+            self.iter = state['iter']
+            self.current_loss = state['current_loss']
             self.encoder.load_state_dict(state['encoder_state_dict'])
             self.decoder.load_state_dict(state['decoder_state_dict'])
             self.generator.load_state_dict(state['generator_dict'])
             self.embedding.load_state_dict(state['embedding_dict'])
             self.decoder_key.load_state_dict(state['decoder_key_state_dict'])
             if (load_optim):
-                self.optimizer.load_state_dict(state['optimizer'])
+                self.scheduler.load_state_dict(state['optimizer'])
             self.eval()
 
         self.model_dir = config.save_path
@@ -294,41 +303,28 @@ class Transformer(nn.Module):
         self.best_path = ""
 
     def save_model(self, running_avg_ppl, iter, f1_g, f1_b, ent_g, ent_b):
-        if config.cause_multitask:
-            state = {
-                'iter': iter,
-                'encoder_state_dict': self.encoder.state_dict(),
-                'decoder_state_dict': self.decoder.state_dict(),
-                'generator_dict': self.generator.state_dict(),
-                'decoder_key_state_dict': self.decoder_key.state_dict(),
-                'cause_evaluator_state_dict': self.cause_evaluator.state_dict(),
-                'embedding_dict': self.embedding.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'current_loss': running_avg_ppl
-            }
-        else:
-            state = {
-                'iter': iter,
-                'encoder_state_dict': self.encoder.state_dict(),
-                'decoder_state_dict': self.decoder.state_dict(),
-                'generator_dict': self.generator.state_dict(),
-                'decoder_key_state_dict': self.decoder_key.state_dict(),
-                'embedding_dict': self.embedding.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'current_loss': running_avg_ppl
-            }
+        self.iter = iter
+        state = {
+            'iter': iter,
+            'encoder_state_dict': self.encoder.state_dict(),
+            'decoder_state_dict': self.decoder.state_dict(),
+            'generator_dict': self.generator.state_dict(),
+            'decoder_key_state_dict': self.decoder_key.state_dict(),
+            'embedding_dict': self.embedding.state_dict(),
+            'optimizer': self.scheduler.state_dict(),
+            'current_loss': running_avg_ppl
+        }
         model_save_path = os.path.join(self.model_dir,
-                                       'model_{}_{:.4f}_{:.4f}_{:.4f}_{:.4f}_{:.4f}'.format(iter, running_avg_ppl, f1_g,
-                                                                                            f1_b, ent_g, ent_b))
+                                       'model_{}_{:.4f}_{:3f}_{:3f}'.format(iter, running_avg_ppl, ent_g, ent_b))
         self.best_path = model_save_path
         torch.save(state, model_save_path)
 
-    def train_one_batch(self, batch, iter, train=True):
+    def train_one_batch(self, batch, train=True):
         enc_batch, cause_batch, enc_batch_extend_vocab = get_input_from_batch(batch)
         dec_batch, _, _ = get_output_from_batch(batch)
 
         if (config.noam):
-            self.optimizer.optimizer.zero_grad()
+            self.scheduler.optimizer.zero_grad()
         else:
             self.optimizer.zero_grad()
 
@@ -339,7 +335,7 @@ class Transformer(nn.Module):
         encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mask, mask_src) # (batch_size, seq_len, hidden_size)
 
         # Decode
-        sos_token = torch.LongTensor([config.SOS_idx] * enc_batch.size(0)).unsqueeze(1).to(self.device)
+        sos_token = torch.LongTensor([config.SOS_idx] * enc_batch.size(0)).unsqueeze(1).to(config.device)
         dec_batch_shift = torch.cat((sos_token, dec_batch[:, :-1]), 1) # make the first token of sentence be SOS
 
         mask_trg = dec_batch_shift.data.eq(config.PAD_idx).unsqueeze(1)
@@ -361,42 +357,18 @@ class Transformer(nn.Module):
             pred_program = np.argmax(logit_prob.detach().cpu().numpy(), axis=1)
             program_acc = accuracy_score(batch["program_label"], pred_program)
 
-        if config.cause_multitask:
-            # add the loss function of cause prediction
-            botcause_clause, botcause_label = batch["botcause_clause"], batch["botcause_label"]
-            batch_size = botcause_clause.size(0)
-            clause_num = botcause_clause.size(1)
-            botcause_clause = botcause_clause.reshape(batch_size * clause_num, -1).to(self.device)
-            botcause_label = botcause_label.reshape(batch_size * clause_num, -1).to(self.device)
-            ### mask_curcause = botcause_clause.data.eq(config.PAD_idx).to(self.device) # (batch_size * num_clause, num_seq)
-            curcause_embed = self.embedding(botcause_clause)  # (batch_size*num_clause, num_seq, hid_dim)
-            # do an attention action with curcause and pre_logit
-            cause_weights = nn.functional.softmax(
-                torch.matmul(curcause_embed, pre_logit.repeat(clause_num, 1, 1).permute(0, 2, 1)), dim=-1)
-            usercause_attn = torch.matmul(cause_weights, pre_logit.repeat(clause_num, 1, 1)).squeeze(-1).to(self.device)
-            curcause = torch.cat((curcause_embed, usercause_attn), dim=-1)
-            curcause_pred = torch.sigmoid(self.cause_evaluator(torch.mean(curcause, dim=-2, keepdim=False)))
-
-            curcause_label = (botcause_label < 0.5).long().reshape(-1, )
-            # loss += nn.CrossEntropyLoss()(curcause_pred, curcause_label)
-            # loss_bce_caz = nn.CrossEntropyLoss()(curcause_pred, curcause_label).item()
-            loss += nn.MSELoss()(botcause_label, curcause_pred).item() * 1.5
-            loss_bce_caz = nn.MSELoss()(botcause_label, curcause_pred).item()
-            pred_cause = np.argmax(curcause_pred.detach().cpu().numpy(), axis=-1)
-            cause_acc = accuracy_score(curcause_label.detach().cpu().numpy(), pred_cause)
-
         if (config.label_smoothing):
             loss_ppl = self.criterion_ppl(logit.contiguous().view(-1, logit.size(-1)),
                                           dec_batch.contiguous().view(-1)).item()
 
         if (train):
             loss.backward()
-            self.optimizer.step()
+            self.scheduler.step()
 
         if (config.label_smoothing):
-            return loss_ppl, math.exp(min(loss_ppl, 100)), (loss_bce_program, loss_bce_caz), (program_acc, cause_acc)
+            return loss_ppl, math.exp(min(loss_ppl, 100)), loss_bce_program, program_acc
         else:
-            return loss.item(), math.exp(min(loss.item(), 100)), (loss_bce_program, loss_bce_caz), (program_acc, cause_acc)
+            return loss.item(), math.exp(min(loss.item(), 100)), loss_bce_program, program_acc
 
     def compute_act_loss(self, module):
         R_t = module.remainders
@@ -408,19 +380,17 @@ class Transformer(nn.Module):
 
     def decoder_greedy(self, batch, max_dec_step=30):
         enc_batch, cause_batch, enc_batch_extend_vocab = get_input_from_batch(batch)
+
         mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
         emb_mask = self.embedding(batch["mask_input"])
         encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mask, mask_src)
 
-        ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(self.device)
+        ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(config.device)
         mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
         decoded_words = []
         for i in range(max_dec_step + 1):
-            if (config.project):
-                out, attn_dist = self.decoder(self.embedding_proj_in(self.embedding(ys)),
-                                              self.embedding_proj_in(encoder_outputs), (mask_src, mask_trg))
-            else:
-                out, attn_dist = self.decoder(self.embedding(ys), encoder_outputs, (mask_src, mask_trg))
+
+            out, attn_dist = self.decoder(self.embedding(ys), encoder_outputs, (mask_src, mask_trg))
 
             prob = self.generator(out, attn_dist, enc_batch_extend_vocab)
             _, next_word = torch.max(prob[:, -1], dim=1)
@@ -428,46 +398,7 @@ class Transformer(nn.Module):
                                   next_word.view(-1)])
             next_word = next_word.data[0]
 
-            ys = torch.cat([ys, torch.ones(1, 1).long().fill_(next_word).to(self.device)], dim=1).to(self.device)
-            mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
-
-        sent = []
-        for _, row in enumerate(np.transpose(decoded_words)):
-            st = ''
-            for e in row:
-                if e == '<EOS>':
-                    break
-                else:
-                    st += e + ' '
-            sent.append(st)
-        return sent
-
-    def decoder_topk(self, batch, max_dec_step=30):
-        enc_batch, cause_batch, enc_batch_extend_vocab = get_input_from_batch(batch)
-
-        mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
-        emb_mask = self.embedding(batch["mask_input"])
-        encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mask, mask_src)
-
-        ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(self.device)
-        mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
-        decoded_words = []
-        for i in range(max_dec_step + 1):
-            if (config.project):
-                out, attn_dist = self.decoder(self.embedding_proj_in(self.embedding(ys)),
-                                              self.embedding_proj_in(encoder_outputs), (mask_src, mask_trg))
-            else:
-                out, attn_dist = self.decoder(self.embedding(ys), encoder_outputs, (mask_src, mask_trg))
-
-            logit = self.generator(out, attn_dist, enc_batch_extend_vocab)
-            filtered_logit = top_k_top_p_filtering(logit[:, -1], top_k=3, top_p=0, filter_value=-float('Inf'))
-            # Sample from the filtered distribution
-            next_word = torch.multinomial(F.softmax(filtered_logit, dim=-1), 1).squeeze()
-            decoded_words.append(['<EOS>' if ni.item() == config.EOS_idx else self.vocab.index2word[ni.item()] for ni in
-                                  next_word.view(-1)])
-            next_word = next_word.data[0]
-
-            ys = torch.cat([ys, torch.ones(1, 1).long().fill_(next_word).to(self.device)], dim=1).to(self.device)
+            ys = torch.cat([ys, torch.ones(1, 1).long().fill_(next_word).to(config.device)], dim=1).to(config.device)
             mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
 
         sent = []

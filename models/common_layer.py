@@ -559,10 +559,8 @@ def _get_attn_subsequent_mask(size):
     attn_shape = (1, size, size)
     subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
     subsequent_mask = torch.from_numpy(subsequent_mask)
-    if (config.USE_CUDA):
-        return subsequent_mask.cuda()
-    else:
-        return subsequent_mask
+
+    return subsequent_mask.to(config.device)
 
 class OutputLayer(nn.Module):
     """
@@ -676,8 +674,9 @@ class LabelSmoothing(nn.Module):
 class NoamOpt:
     "Optim wrapper that implements rate."
 
-    def __init__(self, model_size, factor, warmup, optimizer):
+    def __init__(self, model_size, factor, warmup, optimizer, scheduler):
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self._step = 0
         self.warmup = warmup
         self.factor = factor
@@ -715,14 +714,19 @@ def get_attn_key_pad_mask(seq_k, seq_q):
     return padding_mask
 
 def get_graph_from_batch(batch):
-    graph = batch["graph"]
-    concept_ids = graph["concepts"]
-    relation = graph["relations"]
-    head = graph["head_ids"]
-    tail = graph["tail_ids"]
-    concept_label = graph["labels"]
-    triple_label = graph["triple_labels"]
-    return concept_ids, relation, head, tail, concept_label, triple_label
+    concept_ids = batch["concept_ids"]
+    concept_label = batch["concept_label"]
+    distance = batch["distances"]
+    relation = batch["relations"]
+    head = batch["heads"]
+    tail = batch["tails"]
+    triple_label = batch["triple_label"]
+    vocab_map = batch["vocab_map"].to(config.device)
+    map_mask = batch["map_mask"].to(config.device)
+    graph_num = torch.LongTensor(batch["graph_num"]).to(config.device)
+    if relation.size(-1) == 0:
+        graph_num = torch.LongTensor([0]).to(config.device)
+    return (concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask), graph_num
 
 def get_input_from_batch(batch):
     enc_batch = batch["input_batch"]
@@ -733,8 +737,8 @@ def get_input_from_batch(batch):
     if config.pointer_gen:
         enc_batch_extend_vocab = batch["input_ext_vocab_batch"]
 
-    if config.USE_CUDA and enc_batch_extend_vocab is not None:
-        enc_batch_extend_vocab = enc_batch_extend_vocab.cuda()
+    if enc_batch_extend_vocab is not None:
+        enc_batch_extend_vocab = enc_batch_extend_vocab.to(config.device)
 
     return enc_batch, cause_batch, enc_batch_extend_vocab
 
@@ -748,6 +752,8 @@ def get_output_from_batch(batch):
 
     dec_lens_var = batch["target_lengths"]
     max_dec_len = max(dec_lens_var)
+
+
 
     assert max_dec_len == target_batch.size(1)
 
@@ -784,7 +790,6 @@ def print_custum(emotion, dial, ref, hyp_g, hyp_b):
     print()
     print("Context:{}".format(dial))
     print()
-    # print("Topk:{}".format(hyp_t))
     print("Beam: {}".format(hyp_b))
     print()
     print("Greedy:{}".format(hyp_g))
@@ -816,9 +821,8 @@ def plot_ptr_stats(model):
     plt.savefig(config.save_path + 'bar_plot_with_error_bars.png')
 
 def evaluate(model, data, ty='valid', max_dec_step=30):
-    model.__id__logger = 0
-    dial = []
     ref, hyp_g, hyp_b, hyp_t = [], [], [], []
+    # ref, hyp_g, hyp_b, hyp_t = ["this is to prevent error"], ["this is to prevent error"], ["this is to prevent error"], []
     if ty == "test":
         print("testing generation:")
     t = Translator(model, model.vocab)
@@ -828,7 +832,7 @@ def evaluate(model, data, ty='valid', max_dec_step=30):
     acc = []
     pbar = tqdm(enumerate(data), total=len(data))
     for j, batch in pbar:
-        loss, ppl, bce_prog, acc_prog = model.train_one_batch(batch, 0, train=False)
+        loss, ppl, bce_prog, acc_prog = model.train_one_batch(batch, train=False)
         l.append(loss)
         p.append(ppl)
         bce.append(bce_prog)
@@ -836,25 +840,24 @@ def evaluate(model, data, ty='valid', max_dec_step=30):
         if (ty == "test"):
             sent_g = model.decoder_greedy(batch, max_dec_step=max_dec_step)
             sent_b = t.beam_search(batch, max_dec_step=max_dec_step)
-            # sent_t = model.decoder_topk(batch, max_dec_step=max_dec_step)
             for i, (greedy_sent, beam_sent) in enumerate(zip(sent_g, sent_b)):
-                rf = " ".join(batch["target_txt"][i])
+                rf = " ".join([ele for lis in batch["target_txt"][i] for ele in lis])
                 hyp_g.append(greedy_sent)
                 hyp_b.append(beam_sent)
                 # hyp_t.append(topk_sent)
                 ref.append(rf)
                 print_custum(emotion=batch["program_txt"][i],
                              dial=[" ".join(s) for s in
-                                   batch['input_txt'][i]] if config.dataset == "empathetic" else " ".join(
-                                 batch['input_txt'][i]),
+                                batch['input_txt'][i]] if config.dataset == "empathetic" else " ".join(
+                                batch['input_txt'][i]),
                              ref=rf,
                              # hyp_t=topk_sent,
                              hyp_g=greedy_sent,
                              hyp_b=beam_sent)
-        pbar.set_description("loss:{:.4f} ppl:{:.1f}".format(np.mean(l), math.exp(np.mean(l))))
 
+            pbar.set_description("loss:{:.4f} ppl:{:.1f}".format(np.mean(l), math.exp(np.mean(l))))
     loss = np.mean(l)
-    ppl = np.mean(p)
+    # ppl = np.mean(p)
     if type(bce[0]) == tuple:
         bce_emo = np.mean([b[0] for b in bce])
         bce_cause = np.mean([b[1] for b in bce])
@@ -867,22 +870,23 @@ def evaluate(model, data, ty='valid', max_dec_step=30):
         acc = (acc_emo, acc_cause)
     else:
         acc = np.mean(acc)
-
     bleu_score_g = moses_multi_bleu(np.array(hyp_g), np.array(ref), lowercase=True)
     bleu_score_b = moses_multi_bleu(np.array(hyp_b), np.array(ref), lowercase=True)
-    # bleu_score_t = moses_multi_bleu(np.array(hyp_t), np.array(ref), lowercase=True)
 
     if type(acc) == tuple:
         print("EVAL\tLoss\tPPL\tAccuracy_emo\tAccuracy_cause\tBleu_g\tBleu_b")
         print(
-            "{}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}".format(ty, loss, math.exp(loss), acc[0], acc[1], bleu_score_g,
+            "{}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.2f}\t{:.4f}\t{:.4f}".format(ty, loss, math.exp(loss), acc[0], acc[1], bleu_score_g,
                                                                 bleu_score_b))
     else:
         print("EVAL\tLoss\tPPL\tAccuracy\tBleu_g\tBleu_b")
         print(
-        "{}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.2f}\t{:.2f}".format(ty, loss, math.exp(loss), acc, bleu_score_g, bleu_score_b))
+        "{}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.4f}\t{:.4f}".format(ty, loss, math.exp(loss), acc, bleu_score_g, bleu_score_b))
 
     return loss, math.exp(loss), bce, acc, bleu_score_g, bleu_score_b
+
+
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
