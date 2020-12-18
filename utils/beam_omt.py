@@ -111,7 +111,7 @@ class Translator(object):
         self.lang = lang
         self.vocab_size = lang.n_words
         self.beam_size = config.beam_size
-        self.device = torch.device('cuda' if config.USE_CUDA else 'cpu')
+        self.device = config.device
 
     def beam_search(self, src_seq, max_dec_step):
         ''' Translation work in one batch '''
@@ -175,7 +175,7 @@ class Translator(object):
 
                 db_dist = None
 
-                prob = self.model.generator(dec_output, attn_dist, enc_batch_extend_vocab, extra_zeros, 1, True,
+                prob = self.model.generator(dec_output, attn_dist, enc_batch_extend_vocab, 1, True,
                                             attn_dist_db=db_dist)
                 # prob = F.log_softmax(prob,dim=-1) #fix the name later
                 word_prob = prob[:, -1]
@@ -214,7 +214,7 @@ class Translator(object):
 
         with torch.no_grad():
             # -- Encode
-            enc_batch, _, _, enc_batch_extend_vocab, extra_zeros, _, _ = get_input_from_batch(src_seq)
+            enc_batch, _, _, enc_batch_extend_vocab, extra_zeros, _ = get_input_from_batch(src_seq)
 
             mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
 
@@ -297,18 +297,13 @@ def get_input_from_batch(batch):
 
     c_t_1 = torch.zeros((batch_size, 2 * config.hidden_dim))
 
-    coverage = None
-    if config.is_coverage:
-        coverage = torch.zeros(enc_batch.size())
 
-    if config.USE_CUDA:
-        if enc_batch_extend_vocab is not None:
-            enc_batch_extend_vocab = enc_batch_extend_vocab.cuda()
-        if extra_zeros is not None:
-            extra_zeros = extra_zeros.cuda()
-        c_t_1 = c_t_1.cuda()
+    if enc_batch_extend_vocab is not None:
+        enc_batch_extend_vocab = enc_batch_extend_vocab.to(config.device)
+    if extra_zeros is not None:
+        extra_zeros = extra_zeros.to(config.device)
+    c_t_1 = c_t_1.to(config.device)
 
-        if coverage is not None:
-            coverage = coverage.cuda()
 
-    return enc_batch, enc_padding_mask, enc_lens, enc_batch_extend_vocab, extra_zeros, c_t_1, coverage
+
+    return enc_batch, enc_padding_mask, enc_lens, enc_batch_extend_vocab, extra_zeros, c_t_1

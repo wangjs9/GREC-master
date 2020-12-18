@@ -10,19 +10,16 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import itertools
-import numpy as np
 
 import numpy
-import os
 import re
 import subprocess
 import tempfile
 import numpy as np
 from collections import Counter
-from six.moves import urllib
 import json
 import os
-
+from nltk.translate.bleu_score import sentence_bleu
 # from utils.nlp import normalize
 
 def wer(r, h):
@@ -69,7 +66,6 @@ def wer(r, h):
 """BLEU metric implementation.
 """
 
-
 def moses_multi_bleu(hypotheses, references, lowercase=False):
     """Calculate the bleu score for hypotheses and references
     using the MOSES ulti-bleu.perl script.
@@ -98,23 +94,27 @@ def moses_multi_bleu(hypotheses, references, lowercase=False):
     reference_file.flush()
 
     # Calculate BLEU using multi-bleu script
-    with open(hypothesis_file.name, "rb") as read_pred:
-
-        bleu_cmd = ['perl']
-        bleu_cmd += [multi_bleu_path]
-        if lowercase:
-            bleu_cmd += ["-lc"]
-        bleu_cmd += [reference_file.name]
-        try:
-            bleu_out = subprocess.check_output(bleu_cmd, stdin=read_pred, stderr=subprocess.STDOUT, shell=True)
-            bleu_out = bleu_out.decode("utf-8")
-            bleu_score = re.search(r"BLEU = (.+?),", bleu_out).group(1)
-            bleu_score = float(bleu_score)
-        except subprocess.CalledProcessError as error:
-            if error.output is not None:
-                print("multi-bleu.perl script returned non-zero exit code")
-                print(error.output)
-                bleu_score = np.float32(0.0)
+    # with open(hypothesis_file.name, "rb") as read_pred:
+    # bleu_cmd = ['perl']
+    # bleu_cmd += [multi_bleu_path]
+    # if lowercase:
+    #     bleu_cmd += ["-lc"]
+    # bleu_cmd += [reference_file.name]
+    if lowercase:
+        bleu_cmd = "perl {} -lc {} < {}".format(multi_bleu_path, reference_file.name, hypothesis_file.name)
+    else:
+        bleu_cmd = "perl {} {} < {}".format(multi_bleu_path, reference_file.name, hypothesis_file.name)
+    try:
+        # bleu_out = subprocess.check_output(bleu_cmd, stdin=read_pred, stderr=subprocess.STDOUT, shell=True)
+        bleu_out = subprocess.check_output(bleu_cmd, stderr=subprocess.STDOUT, shell=True)
+        bleu_out = bleu_out.decode("utf-8")
+        bleu_score = re.search(r"BLEU = (.+?),", bleu_out).group(1)
+        bleu_score = float(bleu_score)
+    except subprocess.CalledProcessError as error:
+        if error.output is not None:
+            print("multi-bleu.perl script returned non-zero exit code")
+            print(error.output)
+            bleu_score = np.float32(0.0)
 
     # Close temp files
     hypothesis_file.close()
@@ -135,7 +135,6 @@ def _get_ngrams(n, text):
     for i in range(max_index_ngram_start + 1):
         ngram_set.add(tuple(text[i:i + n]))
     return ngram_set
-
 
 def _split_into_words(sentences):
     """Splits multiple sentences into words and flattens the result"""
