@@ -209,30 +209,9 @@ class Generator(nn.Module):
         self.proj = nn.Linear(d_model, vocab)
         self.p_gen_linear = nn.Linear(config.hidden_dim, 1)
 
-    def forward(self, x, attn_dist=None, enc_batch_extend_vocab=None, temp=1, beam_search=False,
-                attn_dist_db=None):
-
-        if config.pointer_gen:
-            p_gen = self.p_gen_linear(x)
-            alpha = torch.sigmoid(p_gen)
-
+    def forward(self, x):
         logit = self.proj(x)
-
-        if (config.pointer_gen):
-            vocab_dist = F.softmax(logit / temp, dim=2)
-            vocab_dist_ = alpha * vocab_dist
-
-            attn_dist = F.softmax(attn_dist / temp, dim=-1)
-            attn_dist_ = (1 - alpha) * attn_dist
-            enc_batch_extend_vocab_ = torch.cat([enc_batch_extend_vocab.unsqueeze(1)] * x.size(1),
-                                                1)  ## extend for all seq
-            if (beam_search):
-                enc_batch_extend_vocab_ = torch.cat([enc_batch_extend_vocab_[0].unsqueeze(0)] * x.size(0),
-                                                    0)  ## extend for all seq
-            logit = torch.log(vocab_dist_.scatter_add(2, enc_batch_extend_vocab_, attn_dist_))
-            return logit
-        else:
-            return F.log_softmax(logit, dim=-1)
+        return F.log_softmax(logit, dim=-1)
 
 class Transformer(nn.Module):
 
@@ -320,8 +299,8 @@ class Transformer(nn.Module):
         torch.save(state, model_save_path)
 
     def train_one_batch(self, batch, train=True):
-        enc_batch, cause_batch, enc_batch_extend_vocab = get_input_from_batch(batch)
-        dec_batch, _, _ = get_output_from_batch(batch)
+        enc_batch, cause_batch = get_input_from_batch(batch)
+        dec_batch, _ = get_output_from_batch(batch)
 
         if (config.noam):
             self.scheduler.optimizer.zero_grad()
@@ -342,7 +321,7 @@ class Transformer(nn.Module):
         pre_logit, attn_dist = self.decoder(self.embedding(dec_batch_shift), encoder_outputs, (mask_src, mask_trg))
         # shape: pre_logit --> (batch_size, seq_len, hidden_size)
         ## compute output dist
-        logit = self.generator(pre_logit, attn_dist, enc_batch_extend_vocab if config.pointer_gen else None, attn_dist_db=None)
+        logit = self.generator(pre_logit)
 
         loss = self.criterion(logit.contiguous().view(-1, logit.size(-1)), dec_batch.contiguous().view(-1))
 
@@ -379,7 +358,7 @@ class Transformer(nn.Module):
         return loss
 
     def decoder_greedy(self, batch, max_dec_step=30):
-        enc_batch, cause_batch, enc_batch_extend_vocab = get_input_from_batch(batch)
+        enc_batch, cause_batch = get_input_from_batch(batch)
 
         mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
         emb_mask = self.embedding(batch["mask_input"])
@@ -392,7 +371,7 @@ class Transformer(nn.Module):
 
             out, attn_dist = self.decoder(self.embedding(ys), encoder_outputs, (mask_src, mask_trg))
 
-            prob = self.generator(out, attn_dist, enc_batch_extend_vocab)
+            prob = self.generator(out)
             _, next_word = torch.max(prob[:, -1], dim=1)
             decoded_words.append(['<EOS>' if ni.item() == config.EOS_idx else self.vocab.index2word[ni.item()] for ni in
                                   next_word.view(-1)])

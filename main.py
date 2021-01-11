@@ -9,7 +9,6 @@ from tensorboardX import SummaryWriter
 from models.common_layer import evaluate, count_parameters, make_infinite
 from generation.trs import Transformer
 from generation.trs_cause import CauseLSTM
-# from generation.trs_hop import Transformer_CauseHop
 from generation.trs_multihop import MultiHopCause
 from dataprocess.data_loader import prepare_data_seq
 
@@ -17,18 +16,18 @@ def find_model_path(save_path):
     if not os.path.exists(save_path):
         return None
     list = os.listdir(save_path)
-    list = [ele for ele in list if ele[:5] == 'model']
+    list = [ele for ele in list if ele[:12] == 'best_model_1']
     if list == []:
         return None
     list.sort(key=lambda fn: os.path.getmtime(save_path + fn))
-    # model_path = datetime.datetime.fromtimestamp(os.path.getmtime(save_path+list[-1]))
     model_path = os.path.join(save_path, list[-1])
+    print(model_path)
     return model_path
 
-def train_eval(ScaleType, test=False):
+def train_eval(test=False):
     data_loader_tra, data_loader_val, data_loader_tst, vocab, program_number = prepare_data_seq(
         batch_size=config.bz)
-    # exit()
+
     torch.manual_seed(0)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -36,18 +35,25 @@ def train_eval(ScaleType, test=False):
 
     model_file_path = find_model_path(config.save_path)
 
+    # if config.test:
+    #     model = MultiHopCause(vocab, decoder_number=program_number, model_file_path=model_file_path)
+    #
+        # for name, param in model.named_parameters():
+        #     print(name, '      ', param.abs().sum()/param.size().sum())
+        # exit()
     if config.test:
-    # if test:
+
         print('Test model', config.model)
         if config.model == "trs":
             model = Transformer(vocab, decoder_number=program_number, model_file_path=model_file_path)
         elif config.model == 'cause':
             model = CauseLSTM(vocab, decoder_number=program_number, model_file_path=model_file_path)
         elif config.model == 'multihop':
-            model = MultiHopCause(vocab, decoder_number=program_number, model_file_path=model_file_path, load_optim=True)
+            model = MultiHopCause(vocab, decoder_number=program_number, model_file_path=model_file_path)
+        print('TRAINABLE PARAMETERS', count_parameters(model))
         model.to(config.device)
-        evaluate(model, data_loader_tst, ty="test", max_dec_step=50)
-        exit(0)
+        model = model.eval()
+        evaluate(model, data_loader_tst, ty="test", max_dec_step=50, save=True)
 
     if config.model == 'trs':
         model = Transformer(vocab, decoder_number=program_number, model_file_path=model_file_path)
@@ -65,7 +71,7 @@ def train_eval(ScaleType, test=False):
 
     elif config.model == 'multihop':
         # model = Transformer_CauseHop(vocab, decoder_number=program_number, model_file_path=model_file_path)
-        model = MultiHopCause(vocab, decoder_number=program_number, model_file_path=model_file_path)
+        model = MultiHopCause(vocab, decoder_number=program_number, model_file_path=model_file_path, load_optim=True)
         if model_file_path is None:
             for n, p in model.named_parameters():
                 if p.dim() > 1 and n !="embedding.lut.weight" and config.pretrain_emb:
@@ -85,7 +91,7 @@ def train_eval(ScaleType, test=False):
         weights_best = deepcopy(model.state_dict())
         data_iter = make_infinite(data_loader_tra)
         model = model.train()
-        for n_iter in tqdm(range(100000)):
+        for n_iter in tqdm(range(20000)):
             loss, ppl, bce, acc = model.train_one_batch(next(data_iter))
             writer.add_scalars('loss', {'loss_train': loss}, n_iter+init_iter)
             writer.add_scalars('ppl', {'ppl_train': ppl}, n_iter+init_iter)
@@ -136,26 +142,26 @@ def train_eval(ScaleType, test=False):
     except KeyboardInterrupt:
         print('-' * 89)
         print('Exiting from training early')
-    if test:
-        model.load_state_dict({name: weights_best[name] for name in weights_best})
-        model.eval()
-        model.epoch = 100
-        loss_test, ppl_test, bce_test, acc_test, bleu_score_g, bleu_score_b = evaluate(model, data_loader_tst,
-                                                                                       ty="test", max_dec_step=50)
 
-        file_summary = config.save_path + "summary.txt"
-        with open(file_summary, 'w') as the_file:
-            if type(acc_test) == tuple:
-                the_file.write("EVAL\tLoss\tPPL\tAccuracy_emo\tAccuracy_cause\tBleu_g\tBleu_b\n")
-                the_file.write(
-                    "{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.2f}\n".format("test", loss_test, ppl_test, acc_test[0], acc_test[1],
-                                                                          bleu_score_g, bleu_score_b))
-            else:
-                the_file.write("EVAL\tLoss\tPPL\tAccuracy\tBleu_g\tBleu_b\n")
-                the_file.write("{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.2f}\n".format("test", loss_test, ppl_test, acc_test,
-                                                                                 bleu_score_g, bleu_score_b))
+    model.load_state_dict({name: weights_best[name] for name in weights_best})
+    model.eval()
+    model.epoch = 100
+    loss_test, ppl_test, bce_test, acc_test, bleu_score_g, bleu_score_b = evaluate(model, data_loader_tst,
+                                                                                   ty="test", max_dec_step=50, save=True)
+
+    file_summary = config.save_path + "summary.txt"
+    with open(file_summary, 'w') as the_file:
+        if type(acc_test) == tuple:
+            the_file.write("EVAL\tLoss\tPPL\tAccuracy_emo\tAccuracy_cause\tBleu_g\tBleu_b\n")
+            the_file.write(
+                "{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.2f}\n".format("test", loss_test, ppl_test, acc_test[0], acc_test[1],
+                                                                      bleu_score_g, bleu_score_b))
+        else:
+            the_file.write("EVAL\tLoss\tPPL\tAccuracy\tBleu_g\tBleu_b\n")
+            the_file.write("{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.2f}\n".format("test", loss_test, ppl_test, acc_test,
+                                                                             bleu_score_g, bleu_score_b))
 
 
 
 if __name__ == '__main__':
-    train_eval('min', True)
+    train_eval(True)

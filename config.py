@@ -33,16 +33,15 @@ parser.add_argument('--triple_dict', type=str, default='', help='name of concept
 parser.add_argument("--hidden_dim", type=int, default=300)
 parser.add_argument("--cause_hidden_dim", type=int, default=128)
 parser.add_argument("--emb_dim", type=int, default=300)
-parser.add_argument('--bz', type=int, default=32, help='the size of batch')
-parser.add_argument('--lr', type=float, default=1e-5, help='learning rate')
-# parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
+parser.add_argument('--bz', type=int, default=1, help='the size of batch')
+# parser.add_argument('--bz', type=int, default=32, help='the size of batch')
+# parser.add_argument('--lr', type=float, default=1e-5, help='learning rate')
+parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
 parser.add_argument('--schedule', type=int, default=500, help='schedule step')
 parser.add_argument('--weight_decay', type=float, default=5e-6, help='weight decay rate')
 parser.add_argument('--gs', type=int, default=10000, help='total number of global steps')
-parser.add_argument("--beam_size", type=int, default=10)
+parser.add_argument("--beam_size", type=int, default=5)
 
-parser.add_argument('--pointer_gen', action="store_true")
-parser.add_argument('--is_coverage', action="store_true")
 parser.add_argument("--weight_sharing", type=bool, default=True)#action="store_true")
 parser.add_argument("--label_smoothing", type=bool, default=True)#, action="store_true")
 parser.add_argument("--noam", type=bool, default=True)#action="store_true")
@@ -52,7 +51,7 @@ parser.add_argument("--cause_multitask", action="store_true")
 parser.add_argument("--act", type=bool, default=True)#action="store_true")
 parser.add_argument("--act_loss_weight", type=float, default=0.001)
 parser.add_argument("--pretrain_emb", type=bool, default=True)#action="store_true")
-parser.add_argument("--test", action="store_true")
+parser.add_argument("--test", type=bool, default=True)#action="store_true")
 
 
 ## transformer
@@ -94,7 +93,6 @@ depth = arg.depth
 filter = arg.filter
 hop_num = arg.hop_num
 pretrain_emb = arg.pretrain_emb
-pointer_gen = arg.pointer_gen
 label_smoothing = arg.label_smoothing
 weight_sharing = arg.weight_sharing
 noam = arg.noam
@@ -116,8 +114,8 @@ data_vocab = arg.data_vocab
 embed_path = arg.glove_path
 emb_path = arg.emb_path
 emb_file = arg.emb_file.format(str(emb_dim))
+# save_path = arg.save_path if arg.save_path else './save/{}/'.format(model)
 save_path = arg.save_path if arg.save_path else './save/{}/'.format(model)
-# save_path = arg.save_path if arg.save_path else './save/multi-{}/'.format(model)
 posembedding_path = arg.posembedding_path
 concept_vocab = arg.concept_vocab if arg.concept_vocab else '../conceptnet/concept.txt'
 concept_rel = arg.concept_rel if arg.concept_rel else '../conceptnet/relation.txt'
@@ -129,9 +127,9 @@ bz = arg.bz
 lr = arg.lr
 schedule = arg.schedule
 weight_decay = arg.weight_decay
+# test = False
 test = arg.test
 beam_size = arg.beam_size
-# device = 'cpu'
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 

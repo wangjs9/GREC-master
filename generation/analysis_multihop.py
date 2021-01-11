@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 import numpy as np
 import math
-from models.common_layer import EncoderLayer, DecoderLayer, LayerNorm , \
+from models.analysis_common_layer import EncoderLayer, DecoderLayer, LayerNorm , \
     _gen_bias_mask ,_gen_timing_signal, share_embedding, LabelSmoothing, NoamOpt, \
     _get_attn_subsequent_mask,  get_input_from_batch, get_graph_from_batch, get_output_from_batch, \
     top_k_top_p_filtering, PositionwiseFeedForward, gaussian_kld
@@ -181,9 +181,28 @@ class Generator(nn.Module):
         self.proj = nn.Linear(d_model, vocab)
         self.p_gen_linear = nn.Linear(config.hidden_dim, 1)
 
-    def forward(self, x):
+    def forward(self, x, attn_dist=None, enc_batch_extend_vocab=None,
+                temp=1, beam_search=False, attn_dist_db=None):
+
+        if config.pointer_gen:
+            p_gen = self.p_gen_linear(x)
+            alpha = torch.sigmoid(p_gen)
+
         logit = self.proj(x)
-        return F.log_softmax(logit,dim=-1)
+
+        if(config.pointer_gen):
+            vocab_dist = F.softmax(logit/temp, dim=2)
+            vocab_dist_ = alpha * vocab_dist
+
+            attn_dist = F.softmax(attn_dist/temp, dim=-1)
+            attn_dist_ = (1 - alpha) * attn_dist
+            enc_batch_extend_vocab_ = torch.cat([enc_batch_extend_vocab.unsqueeze(1)]*x.size(1),1) ## extend for all seq
+            if(beam_search):
+                enc_batch_extend_vocab_ = torch.cat([enc_batch_extend_vocab_[0].unsqueeze(0)]*x.size(0),0) ## extend for all seq
+            logit = torch.log(vocab_dist_.scatter_add(2, enc_batch_extend_vocab_, attn_dist_))
+            return logit
+        else:
+            return F.log_softmax(logit,dim=-1)
 
 class GLSTM(nn.Module):
     def __init__(self, embedding):
@@ -466,9 +485,9 @@ class MultiHopCause(nn.Module):
         torch.save(state, model_save_path)
 
     def train_one_batch(self, batch, train=True):
-        enc_batch, cause_batch = get_input_from_batch(batch)
+        enc_batch, cause_batch, enc_batch_extend_vocab = get_input_from_batch(batch)
         graphs, graph_num = get_graph_from_batch(batch)
-        dec_batch, dec_lengths = get_output_from_batch(batch)
+        dec_batch, dec_lengths, _ = get_output_from_batch(batch)
         if (config.noam):
             self.scheduler.optimizer.zero_grad()
         else:
@@ -497,7 +516,8 @@ class MultiHopCause(nn.Module):
 
         ## logit
         pre_logit, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
-        logit = self.generator(pre_logit)
+        logit = self.generator(pre_logit, attn_dist, enc_batch_extend_vocab if config.pointer_gen else None,
+                               attn_dist_db=None)
         if torch.sum(graph_num):
             gate, cpt_probs_vocab = self.glstm.comp_pointer(pre_logit, concept_label, distance, head, tail, triple_repr,
                                 triple_label, vocab_map, map_mask)
@@ -539,7 +559,7 @@ class MultiHopCause(nn.Module):
         return loss
 
     def decoder_greedy(self, batch, max_dec_step=30):
-        enc_batch, cause_batch = get_input_from_batch(batch)
+        enc_batch, cause_batch, enc_batch_extend_vocab = get_input_from_batch(batch)
         graphs, graph_num = get_graph_from_batch(batch)
 
         mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
@@ -563,7 +583,7 @@ class MultiHopCause(nn.Module):
 
             out, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
 
-            prob = self.generator(out)
+            prob = self.generator(out, attn_dist, enc_batch_extend_vocab, attn_dist_db=None)
 
             if torch.sum(graph_num):
                 gate, cpt_probs_vocab = self.glstm.comp_pointer(out, concept_label, distance, head, tail, triple_repr,
