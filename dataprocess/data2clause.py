@@ -6,7 +6,6 @@ import nltk
 sen_tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
 
 import config
-from models import cause_extraction
 
 def clean(sentence, word_pairs):
     sentence = sentence.replace('_comma_', ',')
@@ -53,10 +52,10 @@ def ToClause(DataType):
 
     ScaleTypes = ['min', 'sys']
     print('Saving data for sys...')
-    np.save(config.data_npy_dict+'{}_situation_texts.{}.npy'.format(ScaleTypes[1], DataType), situations)
-    np.save(config.data_npy_dict+'{}_dialog_texts.{}.npy'.format(ScaleTypes[1], DataType), history)
-    np.save(config.data_npy_dict+'{}_target_texts.{}.npy'.format(ScaleTypes[1], DataType), targets)
-    np.save(config.data_npy_dict+'{}_emotion_texts.{}.npy'.format(ScaleTypes[1], DataType), emotions)
+    np.save(config.data_npy_dict+'sys_situation_texts.{}.npy'.format(DataType), situations)
+    np.save(config.data_npy_dict+'sys_dialog_texts.{}.npy'.format(DataType), history)
+    np.save(config.data_npy_dict+'sys_target_texts.{}.npy'.format(DataType), targets)
+    np.save(config.data_npy_dict+'sys_emotion_texts.{}.npy'.format(DataType), emotions)
 
     print('Saving data for min...')
     if DataType == 'train':

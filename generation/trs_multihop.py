@@ -6,8 +6,7 @@ import numpy as np
 import math
 from models.common_layer import EncoderLayer, DecoderLayer, LayerNorm , \
     _gen_bias_mask ,_gen_timing_signal, share_embedding, LabelSmoothing, NoamOpt, \
-    _get_attn_subsequent_mask,  get_input_from_batch, get_graph_from_batch, get_output_from_batch, \
-    top_k_top_p_filtering, PositionwiseFeedForward, gaussian_kld
+    _get_attn_subsequent_mask,  get_input_from_batch, get_graph_from_batch, get_output_from_batch
 import config
 import pprint
 pp = pprint.PrettyPrinter(indent=1)
@@ -288,13 +287,7 @@ class GLSTM(nn.Module):
             out.masked_fill_((concept_label == -1).unsqueeze(1), 0)
 
             concept_probs.append(out)
-        print(concept_probs[2].size())
 
-        index = int(concept_probs[2].size(1))
-        with open('text_{}.txt'.format(index), 'w') as f:
-            for i in concept_probs[2][0][-1]:
-                f.write(str(float(i)))
-                f.write('\n')
         '''
         Natural decay of concept that is multi-hop away from source
         '''
@@ -318,7 +311,7 @@ class GLSTM(nn.Module):
 
         ## calculate graph
         memory = self.embedding(concept_ids)
-        rel_repr = self.embedding(relation)
+        rel_repr = self.relation_embd(relation)
         node_repr, rel_repr = self.multi_layer_gcn(memory, rel_repr, head, tail, triple_label,
                                                         layer_number=2)
         head_repr = torch.gather(node_repr, 1,
@@ -329,24 +322,26 @@ class GLSTM(nn.Module):
         triple_repr = self.triple_linear(triple_repr)
 
         encoded_cause = self.lstm(triple_repr.reshape(self.batch_size, self.graph_num, -1, triple_repr.size(-1)))
+        triple_repr = torch.sigmoid(triple_repr)
 
         assert (not torch.isnan(triple_repr).any().item())
 
         return triple_repr, encoded_cause
 
     def comp_pointer(self, hidden_state, concept_label, distance, head, tail, triple_repr, triple_label, vocab_map, map_mask):
+        batch_size = hidden_state.size(0)
         concept_label = concept_label.reshape(-1, concept_label.size(2))
         distance = distance.reshape(-1, distance.size(2))
         head = head.reshape(-1, head.size(2))
         tail = tail.reshape(-1, tail.size(2))
         triple_label = triple_label.reshape(-1, triple_label.size(2))
-        new_hidden_state = hidden_state.unsqueeze(1).expand(-1, self.graph_num, -1, -1).reshape(self.batch_size * self.graph_num, hidden_state.size(1), hidden_state.size(2))
+        new_hidden_state = hidden_state.unsqueeze(1).expand(-1, self.graph_num, -1, -1).reshape(batch_size * self.graph_num, hidden_state.size(1), hidden_state.size(2))
         triple_logits = torch.matmul(new_hidden_state, triple_repr.transpose(1, 2))
         triple_prob = nn.Sigmoid()(triple_logits)
         triple_prob = triple_prob.masked_fill((triple_label == -1).unsqueeze(1), 0)
 
         cpt_probs = self.multi_hop(triple_prob, distance, head, tail, concept_label, triple_label, config.hop_num)
-        cpt_probs = cpt_probs.reshape(self.batch_size, self.graph_num, -1, cpt_probs.size(-1)) # bsz x graph_num x L x mem
+        cpt_probs = cpt_probs.reshape(batch_size, self.graph_num, -1, cpt_probs.size(-1)) # bsz x graph_num x L x mem
         # cpt_probs = cpt_probs.transpose(2, 1).reshape(batch_size, -1, graph_num * cpt_probs.size(-1))
         cpt_probs = F.log_softmax(cpt_probs, dim=-1)
         cpt_probs_vocab = cpt_probs.gather(-1, vocab_map.unsqueeze(2).expand(cpt_probs.size(0),
@@ -356,6 +351,7 @@ class GLSTM(nn.Module):
         # bsz x graph_num x L x vocab
 
         gate = F.log_softmax(self.gate_linear(hidden_state), dim=-1)
+        # gate = self.gate_linear(hidden_state)
         # bsz x L x 1
 
         return gate, cpt_probs_vocab
@@ -368,7 +364,8 @@ class GCNLSTM(nn.Module):
         self.cause_linear = nn.Linear(config.hidden_dim * 2, config.hidden_dim, bias=False)
 
     def forward(self, cause_batch):
-        cause_batch = torch.sum(cause_batch, dim=-2) # batch_size, graph_num, hidden_size
+        # cause_batch = torch.sum(cause_batch, dim=-2) # batch_size, graph_num, hidden_size
+        cause_batch = torch.mean(cause_batch, dim=-2) # batch_size, graph_num, hidden_size
         cause_batch = self.linear(cause_batch)
         _, cause_hid = self.cause_lstm(cause_batch)
         cause_hid = torch.cat((cause_hid[-1], cause_hid[-2]), dim=-1) # batch_size, hidden_size * 2
@@ -458,8 +455,7 @@ class MultiHopCause(nn.Module):
             'optimizer': self.scheduler.state_dict(),
             'current_loss': running_avg_ppl
         }
-        # model_save_path = os.path.join(self.model_dir, 'model_{}_{:.4f}_{:.4f}_{:.4f}_{:.4f}_{:.4f}'.format(
-        #     iter, running_avg_ppl, f1_g, f1_b, ent_g, ent_b))
+
         model_save_path = os.path.join(self.model_dir, 'model_{}_{:.4f}'.format(
             iter, running_avg_ppl))
         self.best_path = model_save_path
@@ -569,10 +565,7 @@ class MultiHopCause(nn.Module):
                 gate, cpt_probs_vocab = self.glstm.comp_pointer(out, concept_label, distance, head, tail, triple_repr,
                                                             triple_label, vocab_map, map_mask)
                 prob = prob * (1 - gate) + gate * cpt_probs_vocab
-            # logit = F.log_softmax(logit,dim=-1) #fix the name later
-            # filtered_logit = top_k_top_p_filtering(logit[:, -1], top_k=0, top_p=0, filter_value=-float('Inf'))
-            # Sample from the filtered distribution
-            # next_word = torch.multinomial(F.softmax(filtered_logit, dim=-1), 1).squeeze()
+
             _, next_word = torch.max(prob[:, -1], dim=1)
             decoded_words.append(['<EOS>' if ni.item() == config.EOS_idx else self.vocab.index2word[ni.item()] for ni in
                                   next_word.view(-1)])

@@ -113,7 +113,7 @@ class Translator(object):
         self.beam_size = config.beam_size
         self.device = config.device
 
-    def beam_search(self, src_seq, max_dec_step):
+    def beam_search(self, batch, max_dec_step):
         ''' Translation work in one batch '''
 
         def get_inst_idx_to_tensor_position_map(inst_idx_list):
@@ -133,14 +133,14 @@ class Translator(object):
 
             return beamed_tensor
 
-        def collate_active_info(src_seq, encoder_db, src_enc, inst_idx_to_position_map, active_inst_idx_list):
+        def collate_active_info(batch, src_enc, inst_idx_to_position_map, active_inst_idx_list):
             # Sentences which are still active are collected,
             # so the decoder will not run on completed sentences.
             n_prev_active_inst = len(inst_idx_to_position_map)
             active_inst_idx = [inst_idx_to_position_map[k] for k in active_inst_idx_list]
             active_inst_idx = torch.LongTensor(active_inst_idx).to(self.device)
 
-            active_src_seq = collect_active_part(src_seq, active_inst_idx, n_prev_active_inst, n_bm)
+            active_src_seq = collect_active_part(batch, active_inst_idx, n_prev_active_inst, n_bm)
             active_src_enc = collect_active_part(src_enc, active_inst_idx, n_prev_active_inst, n_bm)
 
             active_encoder_db = None
@@ -149,9 +149,7 @@ class Translator(object):
 
             return active_src_seq, active_encoder_db, active_src_enc, active_inst_idx_to_position_map
 
-        def beam_decode_step(inst_dec_beams, len_dec_seq, src_seq, enc_output, inst_idx_to_position_map, n_bm,
-                             enc_batch_extend_vocab, extra_zeros, mask_src, encoder_db, mask_transformer_db,
-                             DB_ext_vocab_batch):
+        def beam_decode_step(inst_dec_beams, len_dec_seq,enc_output, inst_idx_to_position_map, n_bm, mask_src, graph_info=None):
             ''' Decode and update beam status, and then return active beam idx '''
 
             def prepare_beam_dec_seq(inst_dec_beams, len_dec_seq):
@@ -165,19 +163,31 @@ class Translator(object):
                 dec_partial_pos = dec_partial_pos.unsqueeze(0).repeat(n_active_inst * n_bm, 1)
                 return dec_partial_pos
 
-            def predict_word(dec_seq, dec_pos, src_seq, enc_output, n_active_inst, n_bm, enc_batch_extend_vocab,
-                             extra_zeros, mask_src, encoder_db, mask_transformer_db, DB_ext_vocab_batch):
+            def predict_word(dec_seq, enc_output, n_active_inst, n_bm, mask_src, other_info):
                 ## masking
                 mask_trg = dec_seq.data.eq(config.PAD_idx).unsqueeze(1)
                 mask_src = torch.cat([mask_src[0].unsqueeze(0)] * mask_trg.size(0), 0)
-                dec_output, attn_dist = self.model.decoder(self.model.embedding(dec_seq), enc_output,
+                if other_info != None and type(other_info) != tuple:
+                    dec_input = self.model.embedding(dec_seq)
+                    dec_input[:, 0] = dec_input[:, 0] + other_info
+                    out, attn_dist = self.model.decoder(dec_input, enc_output, (mask_src, mask_trg))
+                elif type(other_info) == tuple:
+                    cause_repr, concept_label, distance, head, tail, triple_repr, triple_label, vocab_map, map_mask = other_info
+                    dec_input = self.model.embedding(dec_seq)
+                    dec_input[:, 0] = dec_input[:, 0] + cause_repr
+                    out, attn_dist = self.model.decoder(dec_input, enc_output, (mask_src, mask_trg))
+                else:
+                    out, attn_dist = self.model.decoder(self.model.embedding(dec_seq), enc_output,
                                                            (mask_src, mask_trg))
+                if type(other_info) == tuple:
+                    bz = out.size(0)
+                    gate, cpt_probs_vocab = self.model.glstm.comp_pointer(out, torch.cat([concept_label for i in range(bz)], axis=0), torch.cat([distance for i in range(bz)], axis=0),
+                                             torch.cat([head for i in range(bz)], axis=0), torch.cat([tail for i in range(bz)], axis=0), torch.cat([triple_repr for i in range(bz)], axis=0),
+                                            torch.cat([triple_label for i in range(bz)], axis=0), torch.cat([vocab_map for i in range(bz)], axis=0), torch.cat([map_mask for i in range(bz)], axis=0))
+                    prob = self.model.generator(out) * (1 - gate) + gate * cpt_probs_vocab
+                else:
+                    prob = self.model.generator(out)
 
-                db_dist = None
-
-                prob = self.model.generator(dec_output, attn_dist, enc_batch_extend_vocab, 1, True,
-                                            attn_dist_db=db_dist)
-                # prob = F.log_softmax(prob,dim=-1) #fix the name later
                 word_prob = prob[:, -1]
                 word_prob = word_prob.view(n_active_inst, n_bm, -1)
                 return word_prob
@@ -193,9 +203,7 @@ class Translator(object):
             n_active_inst = len(inst_idx_to_position_map)
 
             dec_seq = prepare_beam_dec_seq(inst_dec_beams, len_dec_seq)
-            dec_pos = prepare_beam_dec_pos(len_dec_seq, n_active_inst, n_bm)
-            word_prob = predict_word(dec_seq, dec_pos, src_seq, enc_output, n_active_inst, n_bm, enc_batch_extend_vocab,
-                                     extra_zeros, mask_src, encoder_db, mask_transformer_db, DB_ext_vocab_batch)
+            word_prob = predict_word(dec_seq, enc_output, n_active_inst, n_bm, mask_src, graph_info)
 
             # Update the beam with predicted word prob information and collect incomplete instances
             active_inst_idx_list = collect_active_inst_idx_list(inst_dec_beams, word_prob, inst_idx_to_position_map)
@@ -214,22 +222,32 @@ class Translator(object):
 
         with torch.no_grad():
             # -- Encode
-            enc_batch, _, _, enc_batch_extend_vocab, extra_zeros, _ = get_input_from_batch(src_seq)
+            enc_batch, _, _, _, cause_batch = get_input_from_batch(batch)
 
             mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
+            emb_mask = self.model.embedding(batch["mask_input"])
+            if config.model == 'cause':
+                causepos = self.model.causeposembeding(batch["causepos"])
+                src_enc = self.model.encoder(self.model.embedding(enc_batch) + emb_mask + causepos, mask_src)
+            else:
+                src_enc = self.model.encoder(self.model.embedding(enc_batch) + emb_mask, mask_src)
 
-            emb_mask = self.model.embedding(src_seq["mask_input"])
-            src_enc = self.model.encoder(self.model.embedding(enc_batch) + emb_mask, mask_src)
+            other_info = None
+            if config.model == 'multihop':
+                graphs, use_graph = get_graph_from_batch(batch)
+                if use_graph:
+                    concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask = graphs
+                    triple_repr, cause_repr = self.model.glstm.comp_cause(concept_ids, relation, head, tail,
+                                                                           triple_label)
+                    other_info = (cause_repr, concept_label, distance, head, tail, triple_repr, triple_label, vocab_map, map_mask)
 
-            encoder_db = None
-
-            mask_transformer_db = None
-            DB_ext_vocab_batch = None
+            if config.model == 'cause' and cause_batch.size(-1):
+                other_info = self.model.cause_encoder(self.model.embedding(cause_batch))
 
             # -- Repeat data for beam search
             n_bm = self.beam_size
             n_inst, len_s, d_h = src_enc.size()
-            src_seq = enc_batch.repeat(1, n_bm).view(n_inst * n_bm, len_s)
+            batch = enc_batch.repeat(1, n_bm).view(n_inst * n_bm, len_s)
             src_enc = src_enc.repeat(1, n_bm, 1).view(n_inst * n_bm, len_s, d_h)
 
             # -- Prepare beams
@@ -242,18 +260,16 @@ class Translator(object):
             # -- Decode
             for len_dec_seq in range(1, max_dec_step + 1):
 
-                active_inst_idx_list = beam_decode_step(inst_dec_beams, len_dec_seq, src_seq, src_enc,
-                                                        inst_idx_to_position_map, n_bm, enc_batch_extend_vocab,
-                                                        extra_zeros, mask_src, encoder_db, mask_transformer_db,
-                                                        DB_ext_vocab_batch)
+                active_inst_idx_list = beam_decode_step(inst_dec_beams, len_dec_seq, src_enc,
+                                                        inst_idx_to_position_map, n_bm, mask_src, other_info)
 
                 if not active_inst_idx_list:
                     break  # all instances have finished their path to <EOS>
 
-                src_seq, encoder_db, src_enc, inst_idx_to_position_map = collate_active_info(src_seq, encoder_db,
-                                                                                             src_enc,
-                                                                                             inst_idx_to_position_map,
-                                                                                             active_inst_idx_list)
+                batch, encoder_db, src_enc, inst_idx_to_position_map = collate_active_info(batch,
+                                                                                           src_enc,
+                                                                                           inst_idx_to_position_map,
+                                                                                           active_inst_idx_list)
 
         batch_hyp, batch_scores = collect_hypothesis_and_scores(inst_dec_beams, 1)
 
@@ -281,29 +297,32 @@ def sequence_mask(sequence_length, max_len=None):
 def get_input_from_batch(batch):
     enc_batch = batch["input_batch"]
     enc_lens = batch["input_lengths"]
+    cause_batch = batch["cause_batch"]
     batch_size, max_enc_len = enc_batch.size()
     assert enc_lens.size(0) == batch_size
 
     enc_padding_mask = sequence_mask(enc_lens, max_len=max_enc_len).float()
 
-    extra_zeros = None
-    enc_batch_extend_vocab = None
+    c_t_1 = torch.zeros((batch_size, 2 * config.hidden_dim)).to(config.device)
 
-    if config.pointer_gen:
-        enc_batch_extend_vocab = batch["input_ext_vocab_batch"]
-        # max_art_oovs is the max over all the article oov list in the batch
-        if batch["max_art_oovs"] > 0:
-            extra_zeros = torch.zeros((batch_size, batch["max_art_oovs"]))
-
-    c_t_1 = torch.zeros((batch_size, 2 * config.hidden_dim))
+    enc_batch = batch["input_batch"]
 
 
-    if enc_batch_extend_vocab is not None:
-        enc_batch_extend_vocab = enc_batch_extend_vocab.to(config.device)
-    if extra_zeros is not None:
-        extra_zeros = extra_zeros.to(config.device)
-    c_t_1 = c_t_1.to(config.device)
+    return enc_batch, enc_padding_mask, enc_lens, c_t_1, cause_batch
 
+def get_graph_from_batch(batch):
+    concept_ids = batch["concept_ids"]
+    concept_label = batch["concept_label"]
+    distance = batch["distances"]
+    relation = batch["relations"]
+    head = batch["heads"]
+    tail = batch["tails"]
+    triple_label = batch["triple_label"]
+    vocab_map = batch["vocab_map"].to(config.device)
+    map_mask = batch["map_mask"].to(config.device)
 
-
-    return enc_batch, enc_padding_mask, enc_lens, enc_batch_extend_vocab, extra_zeros, c_t_1
+    if relation.size(-1) == 0:
+        use_graph = False
+    else:
+        use_graph = True
+    return (concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask), use_graph

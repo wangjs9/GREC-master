@@ -11,19 +11,19 @@ SEP_idx = 8
 import argparse, os, torch
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dataset", type=str, default="empathetic")
-# parser.add_argument("--model", type=str, default="trs")
-# parser.add_argument("--model", type=str, default="cause")
-parser.add_argument("--model", type=str, default="multihop")
-
-parser.add_argument('--data_dict', type=str, default='./data/', help='name of data dictionary')
-parser.add_argument('--data_path', type=str, default='./data/dataset_preproc.p', help='name of data file')
-parser.add_argument('--data_vocab', type=str, default='./data/vocab.txt', help='name of data vocabulary file')
-parser.add_argument('--glove_path', type=str, default='../glove.6B/glove.6B.300d.txt', help='name of vocab embedding file')
+parser.add_argument('--dataset', type=str, default='empathetic_dialogues', help='`empathetic_dialogues`, `cornell_movie` or `dailydialog`')
+parser.add_argument("--model", type=str, default="multihop", help='model can be one of `trs`, `cause`, `strategy`, and `multihop`')
+dataset = parser.parse_args().dataset
+if dataset not in ['empathetic_dialogues', 'cornell_movie', 'dailydialog']:
+    raise ValueError('dataste not be one of `empathetic_dialogues`, `cornell_movie` or `dailydialog`')
+parser.add_argument('--data_dict', type=str, default='../data/{}/'.format(dataset), help='name of data dictionary')
+parser.add_argument('--data_path', type=str, default='../data/{}/dataset_preproc.p'.format(dataset), help='name of data file')
+parser.add_argument('--data_vocab', type=str, default='../data/{}/vocab.txt'.format(dataset), help='name of data vocabulary file')
+parser.add_argument('--glove_path', type=str, default='../glove.6B/glove.6B.300d.txt'.format(dataset), help='name of vocab embedding file')
 parser.add_argument("--emb_path", type=str, default="utils/embedding.txt")
 parser.add_argument("--emb_file", type=str, default="../glove.6B/glove.6B.{}d.txt")
 parser.add_argument('--save_path', type=str, default='', help='name of save file')
-parser.add_argument("--posembedding_path", type=str, default="./data/embedding_pos.txt")
+parser.add_argument("--posembedding_path", type=str, default="../data/{}/embedding_pos.txt".format(dataset))
 parser.add_argument('--concept_vocab', type=str, default='', help='name of concept vocabulary file')
 parser.add_argument('--concept_rel', type=str, default='', help='name of concept relation file')
 parser.add_argument('--conceptnet', type=str, default='', help='name of conceptnet file')
@@ -33,9 +33,7 @@ parser.add_argument('--triple_dict', type=str, default='', help='name of concept
 parser.add_argument("--hidden_dim", type=int, default=300)
 parser.add_argument("--cause_hidden_dim", type=int, default=128)
 parser.add_argument("--emb_dim", type=int, default=300)
-parser.add_argument('--bz', type=int, default=1, help='the size of batch')
-# parser.add_argument('--bz', type=int, default=32, help='the size of batch')
-# parser.add_argument('--lr', type=float, default=1e-5, help='learning rate')
+parser.add_argument('--bz', type=int, default=32, help='the size of batch')
 parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
 parser.add_argument('--schedule', type=int, default=500, help='schedule step')
 parser.add_argument('--weight_decay', type=float, default=5e-6, help='weight decay rate')
@@ -51,7 +49,7 @@ parser.add_argument("--cause_multitask", action="store_true")
 parser.add_argument("--act", type=bool, default=True)#action="store_true")
 parser.add_argument("--act_loss_weight", type=float, default=0.001)
 parser.add_argument("--pretrain_emb", type=bool, default=True)#action="store_true")
-parser.add_argument("--test", type=bool, default=True)#action="store_true")
+parser.add_argument("--test", type=bool, default=False)#action="store_true")
 
 
 ## transformer
@@ -114,7 +112,6 @@ data_vocab = arg.data_vocab
 embed_path = arg.glove_path
 emb_path = arg.emb_path
 emb_file = arg.emb_file.format(str(emb_dim))
-# save_path = arg.save_path if arg.save_path else './save/{}/'.format(model)
 save_path = arg.save_path if arg.save_path else './save/{}/'.format(model)
 posembedding_path = arg.posembedding_path
 concept_vocab = arg.concept_vocab if arg.concept_vocab else '../conceptnet/concept.txt'
@@ -127,7 +124,6 @@ bz = arg.bz
 lr = arg.lr
 schedule = arg.schedule
 weight_decay = arg.weight_decay
-# test = False
 test = arg.test
 beam_size = arg.beam_size
 device = 'cuda' if torch.cuda.is_available() else 'cpu'

@@ -6,7 +6,7 @@ import math
 import os
 import pickle
 import config
-from utils.metric import moses_multi_bleu
+from utils.metric import moses_multi_bleu, rouge
 
 from utils.beam_omt import Translator
 import pprint
@@ -15,6 +15,7 @@ from tqdm import tqdm
 pp = pprint.PrettyPrinter(indent=1)
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 torch.manual_seed(0)
 torch.backends.cudnn.deterministic = True
@@ -732,32 +733,15 @@ def get_input_from_batch(batch):
     enc_batch = batch["input_batch"]
     cause_batch = batch["cause_batch"]
 
-    enc_batch_extend_vocab = None
-
-    if config.pointer_gen:
-        enc_batch_extend_vocab = batch["input_ext_vocab_batch"]
-
-    if enc_batch_extend_vocab is not None:
-        enc_batch_extend_vocab = enc_batch_extend_vocab.to(config.device)
-
-    return enc_batch, cause_batch, enc_batch_extend_vocab
+    return enc_batch, cause_batch
 
 def get_output_from_batch(batch):
     dec_batch = batch["target_batch"]
 
-    if (config.pointer_gen):
-        target_batch = batch["target_ext_vocab_batch"]
-    else:
-        target_batch = dec_batch
-
     dec_lens_var = batch["target_lengths"]
     max_dec_len = max(dec_lens_var)
 
-
-
-    assert max_dec_len == target_batch.size(1)
-
-    return dec_batch, dec_lens_var, target_batch
+    return dec_batch, dec_lens_var
 
 def sequence_mask(sequence_length, max_len=None):
     if max_len is None:
@@ -820,9 +804,8 @@ def plot_ptr_stats(model):
     plt.tight_layout()
     plt.savefig(config.save_path + 'bar_plot_with_error_bars.png')
 
-def evaluate(model, data, ty='valid', max_dec_step=30):
-    ref, hyp_g, hyp_b, hyp_t = [], [], [], []
-    # ref, hyp_g, hyp_b, hyp_t = ["this is to prevent error"], ["this is to prevent error"], ["this is to prevent error"], []
+def evaluate(model, data, ty='valid', max_dec_step=30, save=False):
+    emotion_lst, batch_lst, ref, hyp_g, hyp_b = [], [], [], [], []
     if ty == "test":
         print("testing generation:")
     t = Translator(model, model.vocab)
@@ -837,56 +820,54 @@ def evaluate(model, data, ty='valid', max_dec_step=30):
         p.append(ppl)
         bce.append(bce_prog)
         acc.append(acc_prog)
-        if (ty == "test"):
+        if ty == "test":
             sent_g = model.decoder_greedy(batch, max_dec_step=max_dec_step)
             sent_b = t.beam_search(batch, max_dec_step=max_dec_step)
             for i, (greedy_sent, beam_sent) in enumerate(zip(sent_g, sent_b)):
+                emotion_lst.append(batch["program_txt"][i])
+
+                batch_lst.append([" ".join(s) for s in
+                                batch['input_txt'][i]] if config.dataset == "empathetic_dialogues" else " ".join(
+                                batch['input_txt'][i]))
                 rf = " ".join([ele for lis in batch["target_txt"][i] for ele in lis])
                 hyp_g.append(greedy_sent)
                 hyp_b.append(beam_sent)
-                # hyp_t.append(topk_sent)
                 ref.append(rf)
                 print_custum(emotion=batch["program_txt"][i],
                              dial=[" ".join(s) for s in
-                                batch['input_txt'][i]] if config.dataset == "empathetic" else " ".join(
+                                batch['input_txt'][i]] if config.dataset == "empathetic_dialogues" else " ".join(
                                 batch['input_txt'][i]),
                              ref=rf,
-                             # hyp_t=topk_sent,
                              hyp_g=greedy_sent,
                              hyp_b=beam_sent)
 
             pbar.set_description("loss:{:.4f} ppl:{:.1f}".format(np.mean(l), math.exp(np.mean(l))))
+    if ty == "test" and save:
+        emotion_lst = pd.DataFrame(emotion_lst)
+        batch_lst = pd.DataFrame(batch_lst)
+        hyp_g_pd = pd.DataFrame(hyp_g)
+        hyp_b_pd = pd.DataFrame(hyp_b)
+        ref_pd = pd.DataFrame(ref)
+        emotion_lst.to_csv(config.save_path+'test/emotions.csv', index=False, header=False)
+        batch_lst.to_csv(config.save_path+'test/batch.csv', index=False, header=False)
+        hyp_g_pd.to_csv(config.save_path+'test/reply_greedy.csv', index=False, header=False)
+        hyp_b_pd.to_csv(config.save_path+'test/reply_beam.csv', index=False, header=False)
+        ref_pd.to_csv(config.save_path+'test/reply_true.csv', index=False, header=False)
+
     loss = np.mean(l)
-    # ppl = np.mean(p)
-    if type(bce[0]) == tuple:
-        bce_emo = np.mean([b[0] for b in bce])
-        bce_cause = np.mean([b[1] for b in bce])
-        bce = (bce_emo, bce_cause)
-    else:
-        bce = np.mean(bce)
-    if type(acc[0]) == tuple:
-        acc_emo = np.mean([a[0] for a in acc])
-        acc_cause = np.mean([a[1] for a in acc])
-        acc = (acc_emo, acc_cause)
-    else:
-        acc = np.mean(acc)
+    bce = np.mean(bce)
+    acc = np.mean(acc)
     bleu_score_g = moses_multi_bleu(np.array(hyp_g), np.array(ref), lowercase=True)
     bleu_score_b = moses_multi_bleu(np.array(hyp_b), np.array(ref), lowercase=True)
 
-    if type(acc) == tuple:
-        print("EVAL\tLoss\tPPL\tAccuracy_emo\tAccuracy_cause\tBleu_g\tBleu_b")
-        print(
-            "{}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.2f}\t{:.4f}\t{:.4f}".format(ty, loss, math.exp(loss), acc[0], acc[1], bleu_score_g,
-                                                                bleu_score_b))
-    else:
-        print("EVAL\tLoss\tPPL\tAccuracy\tBleu_g\tBleu_b")
-        print(
-        "{}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.4f}\t{:.4f}".format(ty, loss, math.exp(loss), acc, bleu_score_g, bleu_score_b))
+    rouge_score_g = rouge(np.array(hyp_g), np.array(ref))
+    rouge_score_b = rouge(np.array(hyp_b), np.array(ref))
 
-    return loss, math.exp(loss), bce, acc, bleu_score_g, bleu_score_b
+    print("EVAL\tLoss\tPPL\tAccuracy\tBleu_g\tBleu_b\tROUGE_g\tROUGE_b")
+    print(
+    "{}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}".format(ty, loss, math.exp(loss), acc, bleu_score_g, bleu_score_b, rouge_score_g, rouge_score_b))
 
-
-
+    return loss, math.exp(loss), bce, acc, bleu_score_g, bleu_score_b, rouge_score_g, rouge_score_b
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

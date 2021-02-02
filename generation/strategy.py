@@ -4,10 +4,10 @@ import torch.nn.functional as F
 
 import numpy as np
 import math
-from models.analysis_common_layer import EncoderLayer, DecoderLayer, LayerNorm , \
+from models.common_layer import EncoderLayer, DecoderLayer, LayerNorm , \
     _gen_bias_mask ,_gen_timing_signal, share_embedding, LabelSmoothing, NoamOpt, \
     _get_attn_subsequent_mask,  get_input_from_batch, get_graph_from_batch, get_output_from_batch, \
-    top_k_top_p_filtering, PositionwiseFeedForward, gaussian_kld
+    PositionwiseFeedForward, gaussian_kld
 import config
 import pprint
 pp = pprint.PrettyPrinter(indent=1)
@@ -181,28 +181,9 @@ class Generator(nn.Module):
         self.proj = nn.Linear(d_model, vocab)
         self.p_gen_linear = nn.Linear(config.hidden_dim, 1)
 
-    def forward(self, x, attn_dist=None, enc_batch_extend_vocab=None,
-                temp=1, beam_search=False, attn_dist_db=None):
-
-        if config.pointer_gen:
-            p_gen = self.p_gen_linear(x)
-            alpha = torch.sigmoid(p_gen)
-
+    def forward(self, x):
         logit = self.proj(x)
-
-        if(config.pointer_gen):
-            vocab_dist = F.softmax(logit/temp, dim=2)
-            vocab_dist_ = alpha * vocab_dist
-
-            attn_dist = F.softmax(attn_dist/temp, dim=-1)
-            attn_dist_ = (1 - alpha) * attn_dist
-            enc_batch_extend_vocab_ = torch.cat([enc_batch_extend_vocab.unsqueeze(1)]*x.size(1),1) ## extend for all seq
-            if(beam_search):
-                enc_batch_extend_vocab_ = torch.cat([enc_batch_extend_vocab_[0].unsqueeze(0)]*x.size(0),0) ## extend for all seq
-            logit = torch.log(vocab_dist_.scatter_add(2, enc_batch_extend_vocab_, attn_dist_))
-            return logit
-        else:
-            return F.log_softmax(logit,dim=-1)
+        return F.log_softmax(logit,dim=-1)
 
 class GLSTM(nn.Module):
     def __init__(self, embedding):
@@ -307,13 +288,6 @@ class GLSTM(nn.Module):
             out.masked_fill_((concept_label == -1).unsqueeze(1), 0)
 
             concept_probs.append(out)
-        print(concept_probs[2].size())
-
-        index = int(concept_probs[2].size(1))
-        with open('text_{}.txt'.format(index), 'w') as f:
-            for i in concept_probs[2][0][-1]:
-                f.write(str(float(i)))
-                f.write('\n')
         '''
         Natural decay of concept that is multi-hop away from source
         '''
@@ -395,13 +369,88 @@ class GCNLSTM(nn.Module):
         encoded_cause = torch.tanh(encoded_cause)
         return encoded_cause
 
-class MultiHopCause(nn.Module):
+class strategy_CVAE(nn.Module):
+    def __init__(self, hidden_dim=3, filter=5, dropout=0.5):
+        super(strategy_CVAE, self).__init__()
+        self.mean = PositionwiseFeedForward(hidden_dim, filter, hidden_dim,
+                                            layer_config='lll', padding='left', dropout=dropout)
+
+        self.var = PositionwiseFeedForward(hidden_dim, filter, hidden_dim,
+                                           layer_config='lll', padding='left', dropout=dropout)
+
+        self.mean_p = PositionwiseFeedForward(hidden_dim * 2, filter, hidden_dim,
+                                              layer_config='lll', padding='left', dropout=dropout)
+
+        self.var_p = PositionwiseFeedForward(hidden_dim * 2, filter, hidden_dim,
+                                             layer_config='lll', padding='left', dropout=dropout)
+
+    def forward(self, x, x_p):
+        mean = self.mean(x)
+        log_var = self.var(x)
+        eps = torch.randn(x.size()).to(config.device)
+
+        mean_p = self.mean_p(torch.cat((x_p, x), dim=-1))
+        log_var_p = self.var_p(torch.cat((x_p, x), dim=-1))
+        kld_loss = gaussian_kld(mean_p, log_var_p, mean, log_var)
+        kld_loss = torch.mean(kld_loss)
+
+        std = torch.exp(0.5 * log_var_p)
+        z = eps * std + mean_p
+
+        return kld_loss, z
+
+class strategy_decoder(nn.Module):
+    def __init__(self):
+        super(strategy_decoder, self).__init__()
+        self.response_encoder = Encoder(config.emb_dim, config.hidden_dim, num_layers=config.hop,
+                                        num_heads=config.heads,
+                                        max_length=30, total_key_depth=config.depth, total_value_depth=config.depth,
+                                        filter_size=config.filter, universal=config.universal)
+
+        self.echo_decoder = Decoder(config.emb_dim, hidden_size=config.hidden_dim, num_layers=config.hop,
+                                    num_heads=config.heads,
+                                    total_key_depth=config.depth, total_value_depth=config.depth,
+                                    filter_size=config.filter)
+
+        self.cause_decoder = Decoder(config.emb_dim, hidden_size=config.hidden_dim, num_layers=config.hop,
+                                     num_heads=config.heads,
+                                     total_key_depth=config.depth, total_value_depth=config.depth,
+                                     filter_size=config.filter)
+
+        self.emotion_decoder = Decoder(config.emb_dim, hidden_size=config.hidden_dim, num_layers=config.hop,
+                                       num_heads=config.heads,
+                                       total_key_depth=config.depth, total_value_depth=config.depth,
+                                       filter_size=config.filter)
+
+        self.ori_strategy = nn.Linear(config.hidden_dim, 3, bias=False)
+        self.rep_strategy = nn.Linear(config.hidden_dim, 3, bias=False)
+        self.latent_layer = strategy_CVAE(3, 5)
+
+    def forward(self, dec_input, encoder_outputs, mask, train=False):
+        mask_src, mask_trg = mask
+        echo_logit, _ = self.echo_decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
+        emotion_pre_logit, _ = self.emotion_decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
+        cause_pre_logit, _ = self.cause_decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
+        outputs = torch.stack([echo_logit, emotion_pre_logit, cause_pre_logit], dim=1)
+        mask_tgt = dec_input.data.eq(config.PAD_idx).unsqueeze(1)
+        rep_strategy = F.softmax(self.rep_strategy(encoder_outputs[:, 0]), dim=-1)
+        ori_strategy = F.softmax(self.ori_strategy(self.response_encoder(dec_input[:, :30], mask_tgt[:, :30])[:, 0]),
+                                 dim=-1)
+
+        kld_loss, _ = self.latent_layer(ori_strategy, rep_strategy)
+        if train:
+            pre_logit = torch.mul(ori_strategy.view(-1, 3, 1, 1).expand(outputs.size()), outputs).sum(dim=1)
+        else:
+            pre_logit = torch.mul(rep_strategy.view(-1, 3, 1, 1).expand(outputs.size()), outputs).sum(dim=1)
+        return pre_logit, kld_loss
+
+class Strategy(nn.Module):
     def __init__(self, vocab, decoder_number, model_file_path=None, load_optim=False):
         """
         vocab: a Lang type data, which is defined in data_reader.py
         decoder_number: the number of classes
         """
-        super(MultiHopCause, self).__init__()
+        super(Strategy, self).__init__()
         self.iter = 0
         self.current_loss = 1000
         self.device = config.device
@@ -418,11 +467,7 @@ class MultiHopCause(nn.Module):
                                total_key_depth=config.depth, total_value_depth=config.depth,
                                filter_size=config.filter, universal=config.universal)
 
-        self.decoder = Decoder(config.emb_dim, hidden_size=config.hidden_dim, num_layers=config.hop,
-                               num_heads=config.heads,
-                               total_key_depth=config.depth, total_value_depth=config.depth,
-                               filter_size=config.filter)
-
+        self.decoder = strategy_decoder()
         self.decoder_key = nn.Linear(config.hidden_dim, decoder_number, bias=False)
         self.generator = Generator(config.hidden_dim, self.vocab_size)
 
@@ -468,26 +513,29 @@ class MultiHopCause(nn.Module):
         self.iter = iter
         state = {
             'iter': self.iter,
+            'embedding_dict': self.embedding.state_dict(),
             'encoder_state_dict': self.encoder.state_dict(),
             'cause_encoder_dict': self.glstm.state_dict(),
             'decoder_state_dict': self.decoder.state_dict(),
             'generator_dict': self.generator.state_dict(),
             'decoder_key_state_dict': self.decoder_key.state_dict(),
-            'embedding_dict': self.embedding.state_dict(),
             'optimizer': self.scheduler.state_dict(),
             'current_loss': running_avg_ppl
         }
-        # model_save_path = os.path.join(self.model_dir, 'model_{}_{:.4f}_{:.4f}_{:.4f}_{:.4f}_{:.4f}'.format(
-        #     iter, running_avg_ppl, f1_g, f1_b, ent_g, ent_b))
         model_save_path = os.path.join(self.model_dir, 'model_{}_{:.4f}'.format(
             iter, running_avg_ppl))
         self.best_path = model_save_path
         torch.save(state, model_save_path)
 
+    def sampling(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return eps.mul(std).add(mu)
+
     def train_one_batch(self, batch, train=True):
-        enc_batch, cause_batch, enc_batch_extend_vocab = get_input_from_batch(batch)
+        enc_batch, cause_batch = get_input_from_batch(batch)
         graphs, graph_num = get_graph_from_batch(batch)
-        dec_batch, dec_lengths, _ = get_output_from_batch(batch)
+        dec_batch, dec_lengths = get_output_from_batch(batch)
         if (config.noam):
             self.scheduler.optimizer.zero_grad()
         else:
@@ -497,8 +545,7 @@ class MultiHopCause(nn.Module):
         mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
         emb_mak = self.embedding(batch["mask_input"])
         causepos = self.causeposembeding(batch["causepos"])
-        encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mak + causepos,
-                                       mask_src)
+        encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mak + causepos, mask_src)
 
         ## graph processing
         if torch.sum(graph_num):
@@ -515,9 +562,11 @@ class MultiHopCause(nn.Module):
             dec_input[:, 0] = dec_input[:, 0] + cause_repr
 
         ## logit
-        pre_logit, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
-        logit = self.generator(pre_logit, attn_dist, enc_batch_extend_vocab if config.pointer_gen else None,
-                               attn_dist_db=None)
+        pre_logit, kld_loss = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg), train=True)
+
+        ## CVAE strategy
+
+        logit = self.generator(pre_logit)
         if torch.sum(graph_num):
             gate, cpt_probs_vocab = self.glstm.comp_pointer(pre_logit, concept_label, distance, head, tail, triple_repr,
                                 triple_label, vocab_map, map_mask)
@@ -525,6 +574,7 @@ class MultiHopCause(nn.Module):
 
         loss = self.criterion(logit.contiguous().view(-1, logit.size(-1)), dec_batch.contiguous().view(-1))
         loss_bce_program, loss_bce_caz, program_acc = 0, 0, 0
+        loss += kld_loss
 
         # multi-task
         if config.emo_multitask:
@@ -559,7 +609,7 @@ class MultiHopCause(nn.Module):
         return loss
 
     def decoder_greedy(self, batch, max_dec_step=30):
-        enc_batch, cause_batch, enc_batch_extend_vocab = get_input_from_batch(batch)
+        enc_batch, cause_batch = get_input_from_batch(batch)
         graphs, graph_num = get_graph_from_batch(batch)
 
         mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
@@ -567,6 +617,7 @@ class MultiHopCause(nn.Module):
         causepos = self.causeposembeding(batch["causepos"])
         encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mask + causepos,
                                        mask_src)
+
 
         if torch.sum(graph_num):
             concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask = graphs
@@ -581,18 +632,15 @@ class MultiHopCause(nn.Module):
             if torch.sum(graph_num):
                 dec_input[:, 0] = dec_input[:, 0] + cause_repr
 
-            out, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
+            out, _ = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
 
-            prob = self.generator(out, attn_dist, enc_batch_extend_vocab, attn_dist_db=None)
+            prob = self.generator(out)
 
             if torch.sum(graph_num):
                 gate, cpt_probs_vocab = self.glstm.comp_pointer(out, concept_label, distance, head, tail, triple_repr,
                                                             triple_label, vocab_map, map_mask)
                 prob = prob * (1 - gate) + gate * cpt_probs_vocab
-            # logit = F.log_softmax(logit,dim=-1) #fix the name later
-            # filtered_logit = top_k_top_p_filtering(logit[:, -1], top_k=0, top_p=0, filter_value=-float('Inf'))
-            # Sample from the filtered distribution
-            # next_word = torch.multinomial(F.softmax(filtered_logit, dim=-1), 1).squeeze()
+
             _, next_word = torch.max(prob[:, -1], dim=1)
             decoded_words.append(['<EOS>' if ni.item() == config.EOS_idx else self.vocab.index2word[ni.item()] for ni in
                                   next_word.view(-1)])

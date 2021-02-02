@@ -8,7 +8,7 @@ def read_json(filename):
             data.append(json.loads(line))
     return data
 
-def directed_triple(data_path, save_path, max_concepts=400, max_triples=1000):
+def directed_triple(data_path, save_path, max_concepts=400, max_triple=1000):
     # read data from data_path
     data = read_json(data_path)
 
@@ -21,7 +21,6 @@ def directed_triple(data_path, save_path, max_concepts=400, max_triples=1000):
         concepts = e['concepts']
         labels = e['labels']
         distances = e['distances']
-
         for t in triples:
             head, tail = t[0], t[-1]
             head_id = concepts.index(head)
@@ -48,38 +47,65 @@ def directed_triple(data_path, save_path, max_concepts=400, max_triples=1000):
         for result in results:
             shortest_paths.extend(bfs(result, triple_dict, causes))
 
+        ground_truth_concepts = []
         ground_truth_triples = []
         for path in shortest_paths:
             for i, n in enumerate(path[:-1]):
                 ground_truth_triples.append((n, path[i + 1]))
+                ground_truth_concepts.append(n)
+                ground_truth_concepts.append(path[i + 1])
+        ground_truth_concepts = list(set(ground_truth_concepts))
 
         ground_truth_triples_set = set(ground_truth_triples)
 
-        _triples = []
-        triple_labels = []
+        _triples, triple_labels = [], []
+        for e1, e2 in ground_truth_triples_set:
+            for t in triple_dict[e1]:
+                if e2 in t:
+                    _triples.append(t)
+                    triple_labels.append(1)
+
         for k, v in triple_dict.items():
             for t in v:
+                if t in _triples:
+                    continue
                 _triples.append(t)
-                if (t[-1], t[0]) in ground_truth_triples_set:
-                    triple_labels.append(1)
-                else:
-                    triple_labels.append(0)
+                # if (t[-1], t[0]) in ground_truth_triples_set:
+                #     triple_labels.append(1)
+                # else:
+                triple_labels.append(0)
 
-        # concepts = concepts[:max_concepts]
+        if len(concepts) > max_concepts:
+            rest_concepts = list(set(concepts) - set(ground_truth_concepts))
+            rest_len = max_concepts-len(ground_truth_concepts)
+            _concepts = ground_truth_concepts + rest_concepts[:rest_len]
+            e['concepts'] = _concepts
+            e['distances'] = [distances[concepts.index(c)] for c in _concepts]
+            e['labels'] = [distances[labels.index(c)] for c in _concepts]
+            concepts = _concepts
         # _triples = _triples[:max_triples]
         # triple_labels = triple_labels[:max_triples]
 
         heads = []
         tails = []
+        relations = []
         for triple in _triples:
-            heads.append(concepts.index(triple[0]))
-            tails.append(concepts.index(triple[-1]))
+            try:
+                h = concepts.index(triple[0])
+                t = concepts.index(triple[-1])
+                heads.append(h)
+                tails.append(t)
+                relations.append(triple[1])
+                if len(heads) == max_triple:
+                    break
+            except ValueError:
+                continue
 
         max_len = max(max_len, len(_triples))
-        e['relations'] = [x[1] for x in _triples]
+        e['relations'] = relations
         e['head_ids'] = heads
         e['tail_ids'] = tails
-        e['triple_labels'] = triple_labels
+        e['triple_labels'] = triple_labels[:max_triple]
         e.pop('triples')
 
         _data.append(e)

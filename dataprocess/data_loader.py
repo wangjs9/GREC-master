@@ -1,7 +1,6 @@
 import torch
 import torch.utils.data as data
 import logging
-import numpy as np
 import config
 import pprint
 pp = pprint.PrettyPrinter(indent=1)
@@ -28,24 +27,6 @@ class Dataset(data.Dataset):
             'content': 24, 'devastated': 25, 'sentimental': 26, 'caring': 27, 'trusting': 28, 'ashamed': 29,
             'apprehensive': 30, 'faithful': 31}
 
-        self.rel_map = {0: ' be opposite to ', 1: ' be a typical location for ', 2: ' can typically do is ',
-            3: ' cause ', 4: ' make someone want ', 5: ' be created by the process of ',
-            6: ' can be more explanatory through ', 7: ' be a word or phrase that appears within and contributes to ',
-            8: ' is a conscious entity that typically wants ', 9: ' be in the same set of and distinct from ',
-            10: ' happen at the same time of ', 11: ' be derived from ', 12: ' have a common origin like ',
-            13: ' is an inflected form of ', 14: ' have an inherent part or a social construct of possession ',
-            15: ' , in a topic area, technical field, or regional dialect, be a word used in the context of ',
-            16: ' be an event that begins with subevent ', 17: ' be an event that concludes with subevent ',
-            18: ' happen requires the happening of ', 19: ' can be described as or have a property ',
-            20: ' have a subevent ', 21: ' be an example of ', 22: ' is a subtype or a specific instance of ',
-            23: ' be near ', 24: ' be made of ', 25: ' be a specific way to do ', 26: ' be a step toward accomplishing the goal ',
-            27: ' be not the capable of ', 28: ' be a conscious entity that typically wants ', 29: ' can not be described as or have a property ',
-            30: ' be part of ', 31: ' can be done through ', 32: ' be conceptually related to ',
-            33: ' is similar to ', 34: ' symbolically represents ', 35: ' have very similar meanings to ',
-            36: ' be used for ', 37: ' be the capital of ', 38: ' field ', 39: ' genre ', 40: ' genus ', 41: ' be influenced by ',
-            42: ' be known for ', 43: ' language ', 44: ' leader ', 45: ' occupation ', 46: ' product '
-            }
-
     def __len__(self):
         return len(self.data["target"])
 
@@ -58,24 +39,25 @@ class Dataset(data.Dataset):
         item["emotion_text"] = self.data["emotion"][index]
         item["cause_text"] = self.data["usercause"][index]
         item["botcause_text"] = self.data["botcause"][index]
-
         item["cause_label"] = self.data["usercause_label"][index]
         item["botcause_label"] = self.data["botcause_label"][index]
-        graphIdx = self.data["graphidx"][index]
+        graphIdx = self.data["graphidx"][str(index)]
 
-        item["graphs"] = [self.preprocess_graph(self.data["graph"][id]) for id in graphIdx]
+        graphs = self.preprocess_graph([self.data["graphs"][id] for id in graphIdx])
+        item["graph_num"] = len(graphIdx)
+        item["graph_concept_ids"], item["graph_concept_label"], item["graph_distances"], item["graph_relation"], \
+        item["graph_head"], item["graph_tail"], item["graph_triple_label"], item["vocab_map"], item["map_mask"] = graphs
 
         item["context"], item["context_mask"] = self.preprocess((item["situation_text"], item["dialog_text"]))
-        item["cause_batch"] = self.preprocess(["CLS"]+[config.CLS_idx])
-
+        item["cause_batch"] = [self.preprocess(["CLS"]+cause, clause=True) for cause in item["cause_text"] if cause]
         item["context_text"] = item["situation_text"] + [ele for lst in item["dialog_text"] for ele in lst]
         item["clause"] = []
-        item["causepos"] = []
+        item["causepos"] = [0]
         for num, text in enumerate(item["context_text"]):
             clause = self.preprocess(text, clause=True)
             item["clause"].append(clause)
             score = 0
-            for i, label in enumerate(len(item["cause_label"])):
+            for i, label in enumerate(item["cause_label"]):
                 try:
                     score += label[num]
                 except IndexError:
@@ -83,9 +65,9 @@ class Dataset(data.Dataset):
             for i in range(len(clause)):
                 item["causepos"].append(score)
         max_score = max(item["causepos"])
-        item["causepos"] = [65+max_score-score if score else 0 for score in item["causepos"]]
+        item["causepos"] = torch.LongTensor([max_score-score if score else 0 for score in item["causepos"]])
 
-        item["target"] = self.preprocess(item["target_text"]+["EOS"])
+        item["target"] = self.preprocess([w for lis in item["target_text"] for w in lis]+["EOS"], clause=True)
         item["emotion"], item["emotion_label"] = self.preprocess_emo(item["emotion_text"], self.emo_map)
 
         return item
@@ -125,44 +107,78 @@ class Dataset(data.Dataset):
         # >>>>>>>>>> one hot mode and label mode >>>>>>>>>> #
         return program, emo_map[emotion]
 
-    def preprocess_graph(self, graph):
-        concepts = graph["concepts"]
-        heads = graph["head_ids"]
-        tails = graph["tail_ids"]
-        relations = graph["relations"]
-        _relations = []
-        for idx, rel in enumerate(relations):
-            head = concepts[heads[idx]]
-            tail = concepts[tails[idx]]
-            _rel = []
-            for r in rel:
-                r = self.preprocess([head]+r.split()+[tail], clause=True)
-                _rel.append(r)
-            _relations.append(_rel.copy())
-        graph["relations"] = _relations
-        concepts = [self.vocab.word2index[word] if word in self.vocab.word2index else config.UNK_idx for word in
-                    concepts]
-        graph["concepts"] = concepts
+    def preprocess_graph(self, graphs):
+        G_concept_ids, G_concept_label, G_distance, G_relation, G_head, G_tail, G_triple_label = [], [], [], [], [], [], []
+        vocab_maps = []
+        map_mask = [0 for i in range(self.vocab.n_words)]
+        for idx, graph in enumerate(graphs):
+            concepts = graph["concepts"]
+            vocab_map = []
+            for w, idx in self.vocab.word2index.items():
+                try:
+                    pos = concepts.index(w)
+                    vocab_map.append(pos)
+                    map_mask[idx] = 1
+                except ValueError:
+                    vocab_map.append(0)
+            relations = graph["relations"]
+            G_relation.append(torch.LongTensor([r[0] for r in relations]))
 
-        return graph
+            concepts = [self.vocab.word2index[word] if word in self.vocab.word2index else config.UNK_idx for word in
+                    concepts]
+            G_concept_ids.append(torch.LongTensor(concepts))
+            G_distance.append(torch.LongTensor(graph["distances"]))
+            G_head.append(torch.LongTensor(graph["head_ids"]))
+            G_tail.append(torch.LongTensor(graph["tail_ids"]))
+            G_triple_label.append(torch.LongTensor(graph["triple_labels"]))
+            G_concept_label.append(torch.LongTensor(graph["labels"]))
+
+            vocab_maps.append(torch.LongTensor(vocab_map))
+
+        return G_concept_ids, G_concept_label, G_distance, G_relation, G_head, G_tail, G_triple_label, vocab_maps, torch.LongTensor(map_mask)
 
 def collate_fn(data):
-    def merge(sequences, scores=None, positions=None):
+    def merge(sequences, single=True, pad=1):
         """
         padded_seqs: use 1 to pad the rest
         lengths: the lengths of seq in sequences
         """
-        lengths = [len(seq) for seq in sequences]
-        padded_seqs = torch.ones(len(sequences), max(lengths)).long()  ## padding index 1
-        for i, seq in enumerate(sequences):
-            end = lengths[i]
-            padded_seqs[i, :end] = seq[:end]
-        return padded_seqs, lengths
+        if single:
+            lengths = [len(seq) for seq in sequences]
+            padded_seqs = torch.ones(len(sequences), max(lengths)).long()  ## padding index 1
+            padded_seqs *= pad
+            for i, seq in enumerate(sequences):
+                end = lengths[i]
+                padded_seqs[i, :end] = seq[:end]
+            return padded_seqs, lengths
+        else:
+            doc_lengths = [len(doc) for doc in sequences]
+            seq_lengths = [max([len(seq) for seq in doc]) if len(doc) else 0 for doc in sequences]
+            padded_seqs = torch.ones(len(sequences), max(doc_lengths), max(seq_lengths)).long()
+            padded_seqs *= pad
+            for i, doc in enumerate(sequences):
+                for j, seq in enumerate(doc):
+                    end = len(seq)
+                    padded_seqs[i, j, :end] = seq[:end]
+            lengths = [[len(seq) for seq in doc]+[0 for i in range(max(doc_lengths)-len(doc))] for doc in sequences]
+            return padded_seqs, lengths
 
     data.sort(key=lambda x: len(x["context"]), reverse=True)  ## sort by source seq
     item_info = {}
     for key in data[0].keys():
         item_info[key] = [d[key] for d in data]
+
+    ## graph
+    concept_ids, concept_num = merge(item_info["graph_concept_ids"], single=False)
+    distances, _ = merge(item_info["graph_distances"], single=False, pad=0)
+    relations, triple_num = merge(item_info["graph_relation"], single=False)
+    heads, _ = merge(item_info["graph_head"], single=False)
+    tails, _ = merge(item_info["graph_tail"], single=False)
+    triple_label, _ = merge(item_info["graph_triple_label"], single=False, pad=-1)
+    concept_label, _ = merge(item_info["graph_concept_label"], single=False, pad=-1)
+    vocab_map, _ = merge(item_info["vocab_map"], single=False, pad=0)
+    map_mask, _ = merge(item_info["map_mask"], pad=0)
+
 
     ## input
     input_batch, input_lengths = merge(item_info['context'])
@@ -170,35 +186,40 @@ def collate_fn(data):
     causepos, _ = merge(item_info['causepos'])
 
     ## clause
-    clause_batch, _ = merge(item_info["clause"])
+    cause_batch, _ = merge(item_info['cause_batch'], single=False)
+    clause_batch, _ = merge(item_info["clause"], single=False)
 
     ## Target
     target_batch, target_lengths = merge(item_info['target'])
 
-    if config.USE_CUDA:
-        input_batch = input_batch.cuda()
-        mask_input = mask_input.cuda()
-        target_batch = target_batch.cuda()
-        causepos = causepos.cuda()
-
-
     d = {}
-    d["input_batch"] = input_batch
+    d["input_batch"] = input_batch.to(config.device)
     d["input_lengths"] = torch.LongTensor(input_lengths)  # mask_input_lengths equals input_lengths
-    d["causepos"] = causepos
-    d["mask_input"] = mask_input
+    d["causepos"] = causepos.to(config.device)
+    d["mask_input"] = mask_input.to(config.device)
     ##cause
-    d["cause_batch"] = item_info['cause_batch']
-    d["botcause_clause"] = clause_batch
+    d["cause_batch"] = cause_batch.to(config.device)
+    d["botcause_clause"] = clause_batch.to(config.device)
     d["botcause_label"] = item_info['botcause_label']
     ##target
-    d["target_batch"] = target_batch
+    d["target_batch"] = target_batch.to(config.device)
     d["target_lengths"] = torch.LongTensor(target_lengths)
     ##program
     d["target_program"] = item_info['emotion']  # one hot format
     d["program_label"] = item_info['emotion_label']
     ##graph
-    d["graphs"] = item_info['graphs']
+    d["concept_ids"] = concept_ids.to(config.device)
+    d["concept_num"] = concept_num
+    d["distances"] = distances.to(config.device)
+    d["relations"] = relations.to(config.device)
+    d["triple_num"] = triple_num
+    d["heads"] = heads.to(config.device)
+    d["tails"] = tails.to(config.device)
+    d["concept_label"] = concept_label.to(config.device)
+    d["triple_label"] = triple_label.to(config.device)
+    d["graph_num"] = item_info["graph_num"]
+    d["vocab_map"] = vocab_map
+    d["map_mask"] = map_mask
     ##text
     d["input_txt"] = item_info['context_text']
     d["target_txt"] = item_info['target_text']
@@ -220,6 +241,7 @@ def prepare_data_seq(batch_size=32):
     data_loader_tra = torch.utils.data.DataLoader(dataset=dataset_train,
                               batch_size=batch_size,
                               shuffle=True, collate_fn=collate_fn)
+    # return data_loader_tra, None, None, vocab, len(dataset_train.emo_map)
 
     dataset_valid = Dataset(pairs_val, vocab)
     data_loader_val = torch.utils.data.DataLoader(dataset=dataset_valid,

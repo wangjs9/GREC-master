@@ -94,12 +94,6 @@ def moses_multi_bleu(hypotheses, references, lowercase=False):
     reference_file.flush()
 
     # Calculate BLEU using multi-bleu script
-    # with open(hypothesis_file.name, "rb") as read_pred:
-    # bleu_cmd = ['perl']
-    # bleu_cmd += [multi_bleu_path]
-    # if lowercase:
-    #     bleu_cmd += ["-lc"]
-    # bleu_cmd += [reference_file.name]
     if lowercase:
         bleu_cmd = "perl {} -lc {} < {}".format(multi_bleu_path, reference_file.name, hypothesis_file.name)
     else:
@@ -399,6 +393,8 @@ def rouge(hypotheses, references):
     # hypotheses, references = zip(*hyps_and_refs)
 
     # Calculate ROUGE-1 F1, precision, recall scores
+    if len(hypotheses)==0 or len(references)==0:
+        return 0
     rouge_1 = [
         rouge_n([hyp], [ref], 1) for hyp, ref in zip(hypotheses, references)
     ]
