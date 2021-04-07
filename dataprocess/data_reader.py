@@ -40,66 +40,69 @@ class Lang:
 
 def read_langs(vocab):
     # >>>>>>>>>> word pairs: replace some sentences in the paragraph >>>>>>>>>> #
-    ScaleType = 'sys'
-
     # >>>>>>>>>> historical utterances >>>>>>>>>> #
-    train_dialog = np.load(config.data_npy_dict+'{}_dialog_texts.train.npy'.format(ScaleType), allow_pickle=True)
+    train_dialog = np.load(config.data_npy_dict+'sys_dialog_texts.train.npy', allow_pickle=True)
     # >>>>>>>>>> next expected utterance from the bot >>>>>>>>>> #
-    train_target = np.load(config.data_npy_dict+'{}_target_texts.train.npy'.format(ScaleType), allow_pickle=True)
+    train_target = np.load(config.data_npy_dict+'sys_target_texts.train.npy', allow_pickle=True)
     # >>>>>>>>>> emotions of the conversation >>>>>>>>>> #
-    train_emotion = np.load(config.data_npy_dict+'{}_emotion_texts.train.npy'.format(ScaleType), allow_pickle=True)
+    train_emotion = np.load(config.data_npy_dict+'sys_emotion_texts.train.npy', allow_pickle=True)
     # >>>>>>>>>> prompts of the conversation >>>>>>>>>> #
-    train_situation = np.load(config.data_npy_dict+'{}_situation_texts.train.npy'.format(ScaleType), allow_pickle=True)
+    train_situation = np.load(config.data_npy_dict+'sys_situation_texts.train.npy', allow_pickle=True)
     necessary_file = ['usercause_texts', 'botcause_texts', 'usercause_labels', 'botcause_labels']
     for file in necessary_file:
-        if not os.path.exists(config.data_npy_dict + '{}_{}.train.npy'.format(ScaleType, file)):
+        if not os.path.exists(config.data_npy_dict + 'sys_{}.train.npy'.format(file)):
             print('Generating cause clauses...')
             predict(train_situation, train_dialog, train_target, 'train', config.data_npy_dict)
             break
     # >>>>>>>>>> usercause of the conversation >>>>>>>>>> #
-    train_usercause = np.load(config.data_npy_dict + '{}_usercause_texts.train.npy'.format(ScaleType), allow_pickle=True)
+    train_usercause = np.load(config.data_npy_dict + 'sys_usercause_texts.train.npy', allow_pickle=True)
     # >>>>>>>>>> botcause of the conversation >>>>>>>>>> #
-    train_botcause = np.load(config.data_npy_dict + '{}_botcause_texts.train.npy'.format(ScaleType), allow_pickle=True)
+    # train_botcause = np.load(config.data_npy_dict + 'sys_botcause_texts.train.npy', allow_pickle=True)
     # >>>>>>>>>> usercause label of the conversation >>>>>>>>>> #
-    train_usercause_label = np.load(config.data_npy_dict + '{}_usercause_labels.train.npy'.format(ScaleType),
+    train_usercause_label = np.load(config.data_npy_dict + 'sys_usercause_labels.train.npy',
                               allow_pickle=True)
     # >>>>>>>>>> botcause label of the conversation >>>>>>>>>> #
-    train_botcause_label = np.load(config.data_npy_dict + '{}_botcause_labels.train.npy'.format(ScaleType),
-                              allow_pickle=True)
+    # train_botcause_label = np.load(config.data_npy_dict + 'sys_botcause_labels.train.npy',allow_pickle=True)
+    train_act_label = np.load(config.data_npy_dict + 'sys_act_texts.train.npy', allow_pickle=True)
+    train_fake_same_act = np.load(config.data_npy_dict + 'sys_fake_same_act.train.npy', allow_pickle=True)
+    train_fake_same_emo = np.load(config.data_npy_dict + 'sys_fake_same_emo.train.npy', allow_pickle=True)
 
-    dev_dialog = np.load(config.data_npy_dict+'{}_dialog_texts.valid.npy'.format(ScaleType), allow_pickle=True)
-    dev_target = np.load(config.data_npy_dict+'{}_target_texts.valid.npy'.format(ScaleType), allow_pickle=True)
-    dev_emotion = np.load(config.data_npy_dict+'{}_emotion_texts.valid.npy'.format(ScaleType), allow_pickle=True)
-    dev_situation = np.load(config.data_npy_dict+'{}_situation_texts.valid.npy'.format(ScaleType), allow_pickle=True)
+    dev_dialog = np.load(config.data_npy_dict+'sys_dialog_texts.valid.npy', allow_pickle=True)
+    dev_target = np.load(config.data_npy_dict+'sys_target_texts.valid.npy', allow_pickle=True)
+    dev_emotion = np.load(config.data_npy_dict+'sys_emotion_texts.valid.npy', allow_pickle=True)
+    dev_situation = np.load(config.data_npy_dict+'sys_situation_texts.valid.npy', allow_pickle=True)
+
     for file in necessary_file:
-        if not os.path.exists(config.data_npy_dict + '{}_{}.valid.npy'.format(ScaleType, file)):
+        if not os.path.exists(config.data_npy_dict + 'sys_{}.valid.npy'.format(file)):
             print('Generating cause clauses...')
             predict(dev_situation, dev_dialog, dev_target, 'valid', config.data_npy_dict)
-    dev_usercause = np.load(config.data_npy_dict + '{}_usercause_texts.valid.npy'.format(ScaleType), allow_pickle=True)
-    dev_botcause = np.load(config.data_npy_dict + '{}_botcause_texts.valid.npy'.format(ScaleType), allow_pickle=True)
-    dev_usercause_label = np.load(config.data_npy_dict + '{}_usercause_labels.valid.npy'.format(ScaleType),
-                                    allow_pickle=True)
-    dev_botcause_label = np.load(config.data_npy_dict + '{}_botcause_labels.valid.npy'.format(ScaleType),
-                                   allow_pickle=True)
+    dev_usercause = np.load(config.data_npy_dict + 'sys_usercause_texts.valid.npy', allow_pickle=True)
+    # dev_botcause = np.load(config.data_npy_dict + 'sys_botcause_texts.valid.npy', allow_pickle=True)
+    dev_usercause_label = np.load(config.data_npy_dict + 'sys_usercause_labels.valid.npy', allow_pickle=True)
+    # dev_botcause_label = np.load(config.data_npy_dict + 'sys_botcause_labels.valid.npy', allow_pickle=True)
+    dev_act_label = np.load(config.data_npy_dict + 'sys_act_texts.valid.npy', allow_pickle=True)
+    dev_fake_same_act = np.load(config.data_npy_dict + 'sys_fake_same_act.valid.npy', allow_pickle=True)
+    dev_fake_same_emo = np.load(config.data_npy_dict + 'sys_fake_same_emo.valid.npy', allow_pickle=True)
 
-    test_dialog = np.load(config.data_npy_dict+'{}_dialog_texts.test.npy'.format(ScaleType), allow_pickle=True)
-    test_target = np.load(config.data_npy_dict+'{}_target_texts.test.npy'.format(ScaleType), allow_pickle=True)
-    test_emotion = np.load(config.data_npy_dict+'{}_emotion_texts.test.npy'.format(ScaleType), allow_pickle=True)
-    test_situation = np.load(config.data_npy_dict+'{}_situation_texts.test.npy'.format(ScaleType), allow_pickle=True)
+    test_dialog = np.load(config.data_npy_dict+'sys_dialog_texts.test.npy', allow_pickle=True)
+    test_target = np.load(config.data_npy_dict+'sys_target_texts.test.npy', allow_pickle=True)
+    test_emotion = np.load(config.data_npy_dict+'sys_emotion_texts.test.npy', allow_pickle=True)
+    test_situation = np.load(config.data_npy_dict+'sys_situation_texts.test.npy', allow_pickle=True)
     for file in necessary_file:
-        if not os.path.exists(config.data_npy_dict + '{}_{}.test.npy'.format(ScaleType, file)):
+        if not os.path.exists(config.data_npy_dict + 'sys_{}.test.npy'.format(file)):
             print('Generating cause clauses...')
             predict(test_situation, test_dialog, test_target, 'test', config.data_npy_dict)
-    test_usercause = np.load(config.data_npy_dict + '{}_usercause_texts.test.npy'.format(ScaleType), allow_pickle=True)
-    test_botcause = np.load(config.data_npy_dict + '{}_botcause_texts.test.npy'.format(ScaleType), allow_pickle=True)
-    test_usercause_label = np.load(config.data_npy_dict + '{}_usercause_labels.test.npy'.format(ScaleType),
-                                  allow_pickle=True)
-    test_botcause_label = np.load(config.data_npy_dict + '{}_botcause_labels.test.npy'.format(ScaleType),
-                                 allow_pickle=True)
+    test_usercause = np.load(config.data_npy_dict + 'sys_usercause_texts.test.npy', allow_pickle=True)
+    # test_botcause = np.load(config.data_npy_dict + 'sys_botcause_texts.test.npy', allow_pickle=True)
+    test_usercause_label = np.load(config.data_npy_dict + 'sys_usercause_labels.test.npy', allow_pickle=True)
+    # test_botcause_label = np.load(config.data_npy_dict + 'sys_botcause_labels.test.npy'., allow_pickle=True)
+    test_act_label = np.load(config.data_npy_dict + 'sys_act_texts.test.npy', allow_pickle=True)
+    test_fake_same_act = np.load(config.data_npy_dict + 'sys_fake_same_act.test.npy', allow_pickle=True)
+    test_fake_same_emo = np.load(config.data_npy_dict + 'sys_fake_same_emo.test.npy', allow_pickle=True)
 
-    data_train = {'dialog': [], 'target': [], 'emotion': [], 'situation': [], 'usercause_label': [], 'botcause_label': [], 'usercause':[], 'botcause': [], 'graphs':[], 'graphidx': []}
-    data_dev = {'dialog': [], 'target': [], 'emotion': [], 'situation': [], 'usercause_label': [], 'botcause_label': [], 'usercause': [], 'botcause': [], 'graphs': [], 'graphidx': []}
-    data_test = {'dialog': [], 'target': [], 'emotion': [], 'situation': [], 'usercause_label': [], 'botcause_label': [], 'usercause': [], 'botcause': [], 'graphs': [], 'graphidx': []}
+    data_train = {'dialog': [], 'target': [], 'emotion': train_emotion, 'situation': [], 'usercause_label': train_usercause_label, 'usercause':[], 'graphs':[], 'graphidx': [], 'act_label': train_act_label, 'fake_same_act': train_fake_same_act, 'fake_same_emo': train_fake_same_emo}
+    data_dev = {'dialog': [], 'target': [], 'emotion': [], 'situation': [], 'usercause_label': dev_usercause_label, 'usercause': [], 'graphs': [], 'graphidx': [], 'act_label': dev_act_label, 'fake_same_act': dev_fake_same_act, 'fake_same_emo': dev_fake_same_emo}
+    data_test = {'dialog': [], 'target': [], 'emotion': [], 'situation': [], 'usercause_label': test_usercause_label, 'usercause': [], 'graphs': [], 'graphidx': [], 'act_label': test_act_label, 'fake_same_act': test_fake_same_act, 'fake_same_emo': test_fake_same_emo}
 
     for dialog in train_dialog:
         u_lists = []
@@ -130,9 +133,6 @@ def read_langs(vocab):
             vocab.index_words(u)
         data_train['situation'].append(u_list)
 
-    for emotion in train_emotion:
-        data_train['emotion'].append(emotion)
-
     for cause in train_usercause:
         u_lists = []
         for utts in cause:
@@ -140,22 +140,16 @@ def read_langs(vocab):
             u_lists.append(u_list)
         data_train['usercause'].append(u_lists)
 
-    for cause in train_botcause:
-        u_lists = []
-        for utts in cause:
-            u_list = nltk.word_tokenize(utts)
-            u_lists.append(u_list)
-        data_train['botcause'].append(u_lists)
+    # for cause in train_botcause:
+    #     u_lists = []
+    #     for utts in cause:
+    #         u_list = nltk.word_tokenize(utts)
+    #         u_lists.append(u_list)
+    #     data_train['botcause'].append(u_lists)
 
-    for label in train_usercause_label:
-        data_train['usercause_label'].append(label)
-
-    for label in train_botcause_label:
-        data_train['botcause_label'].append(label)
 
     assert len(data_train['dialog']) == len(data_train['target']) == len(data_train['emotion']) == len(
-        data_train['situation']) == len(data_train['usercause']) == len(data_train['botcause']) == len(
-        data_train['usercause_label']) == len(data_train['botcause_label'])
+        data_train['situation']) == len(data_train['usercause']) == len(data_train['usercause_label'])
 
     for dialog in dev_dialog:
         u_lists = []
@@ -194,22 +188,16 @@ def read_langs(vocab):
             u_lists.append(u_list)
         data_dev['usercause'].append(u_lists)
 
-    for cause in dev_botcause:
-        u_lists = []
-        for utts in cause:
-            u_list = nltk.word_tokenize(utts)
-            u_lists.append(u_list)
-        data_dev['botcause'].append(u_lists)
+    # for cause in dev_botcause:
+    #     u_lists = []
+    #     for utts in cause:
+    #         u_list = nltk.word_tokenize(utts)
+    #         u_lists.append(u_list)
+    #     data_dev['botcause'].append(u_lists)
 
-    for label in dev_usercause_label:
-        data_dev['usercause_label'].append(label)
-
-    for label in dev_botcause_label:
-        data_dev['botcause_label'].append(label)
 
     assert len(data_dev['dialog']) == len(data_dev['target']) == len(data_dev['emotion']) == len(
-        data_dev['situation']) == len(data_dev['usercause']) == len(data_dev['botcause']) == len(
-        data_dev['usercause_label']) == len(data_dev['botcause_label'])
+        data_dev['situation']) == len(data_dev['usercause']) == len(data_dev['usercause_label'])
 
     for dialog in test_dialog:
         u_lists = []
@@ -248,27 +236,26 @@ def read_langs(vocab):
             u_lists.append(u_list)
         data_test['usercause'].append(u_lists)
 
-    for cause in test_botcause:
-        u_lists = []
-        for utts in cause:
-            u_list = nltk.word_tokenize(utts)
-            u_lists.append(u_list)
-        data_test['botcause'].append(u_lists)
+    # for cause in test_botcause:
+    #     u_lists = []
+    #     for utts in cause:
+    #         u_list = nltk.word_tokenize(utts)
+    #         u_lists.append(u_list)
+    #     data_test['botcause'].append(u_lists)
 
-    for label in test_usercause_label:
-        data_test['usercause_label'].append(label)
+    # for label in test_usercause_label:
+    #     data_test['usercause_label'].append(label)
 
-    for label in test_botcause_label:
-        data_test['botcause_label'].append(label)
+    # for label in test_botcause_label:
+    #     data_test['botcause_label'].append(label)
 
     assert len(data_test['dialog']) == len(data_test['target']) == len(data_test['emotion']) == len(
-        data_test['situation']) == len(data_test['usercause']) == len(data_test['botcause']) == len(
-        data_test['usercause_label']) == len(data_test['botcause_label'])
+        data_test['situation']) == len(data_test['usercause']) == len(data_test['usercause_label'])
 
     T = 2
     # >>>>>>>>>> causes of the conversation train >>>>>>>>>> #
-    if not os.path.exists(config.data_npy_dict + '{}_UserCause_{}_Path.train.json'.format(ScaleType, T)):
-        train_usercause = np.load(config.data_npy_dict + '{}_usercause_texts.train.npy'.format(ScaleType),
+    if not os.path.exists(config.data_npy_dict + 'sys_UserCause_{}_Path.train.json'.format(T)):
+        train_usercause = np.load(config.data_npy_dict + 'sys_usercause_texts.train.npy',
                                   allow_pickle=True)
         results, causes, idlist = [], [], []
         for idx, dialog in enumerate(train_dialog):
@@ -277,12 +264,12 @@ def read_langs(vocab):
                 results.append(utts)
                 causes.append(train_usercause[idx][jdx])
 
-        newIdlist = process(config.data_npy_dict + '{}_UserCause_{}_Path.train.json'.format(ScaleType, T), causes, results, idlist, T)
-        with open(config.data_npy_dict + '{}_UserCause_{}_PathId.train.json'.format(ScaleType, T), 'w') as f:
+        newIdlist = process(config.data_npy_dict + 'sys_UserCause_{}_Path.train.json'.format(T), causes, results, idlist, T)
+        with open(config.data_npy_dict + 'sys_UserCause_{}_PathId.train.json'.format(T), 'w') as f:
             json.dump(newIdlist, f)
 
-    if not os.path.exists(config.data_npy_dict + '{}_UserCause_{}_Path.valid.json'.format(ScaleType, T)):
-        dev_usercause = np.load(config.data_npy_dict + '{}_usercause_texts.valid.npy'.format(ScaleType),
+    if not os.path.exists(config.data_npy_dict + 'sys_UserCause_{}_Path.valid.json'.format(T)):
+        dev_usercause = np.load(config.data_npy_dict + 'sys_usercause_texts.valid.npy',
                                 allow_pickle=True)
         results, causes, idlist = [], [], []
         for idx, dialog in enumerate(dev_dialog):
@@ -291,12 +278,12 @@ def read_langs(vocab):
                 results.append(utts)
                 causes.append(dev_usercause[idx][jdx])
 
-        newIdlist = process(config.data_npy_dict + '{}_UserCause_{}_Path.valid.json'.format(ScaleType, T), causes, results, idlist, T)
-        with open(config.data_npy_dict + '{}_UserCause_{}_PathId.valid.json'.format(ScaleType, T), 'w') as f:
+        newIdlist = process(config.data_npy_dict + 'sys_UserCause_{}_Path.valid.json'.format(T), causes, results, idlist, T)
+        with open(config.data_npy_dict + 'sys_UserCause_{}_PathId.valid.json'.format(T), 'w') as f:
             json.dump(newIdlist, f)
 
-    if not os.path.exists(config.data_npy_dict + '{}_UserCause_{}_Path.test.json'.format(ScaleType, T)):
-        test_usercause = np.load(config.data_npy_dict + '{}_usercause_texts.test.npy'.format(ScaleType),
+    if not os.path.exists(config.data_npy_dict + 'sys_UserCause_{}_Path.test.json'.format(T)):
+        test_usercause = np.load(config.data_npy_dict + 'sys_usercause_texts.test.npy',
                                  allow_pickle=True)
         results, causes, idlist = [], [], []
         for idx, dialog in enumerate(test_dialog):
@@ -305,41 +292,41 @@ def read_langs(vocab):
                 results.append(utts)
                 causes.append(test_usercause[idx][jdx])
 
-        newIdlist = process(config.data_npy_dict + '{}_UserCause_{}_Path.test.json'.format(ScaleType, T), causes, results, idlist, T)
-        with open(config.data_npy_dict + '{}_UserCause_{}_PathId.test.json'.format(ScaleType, T), 'w') as f:
+        newIdlist = process(config.data_npy_dict + 'sys_UserCause_{}_Path.test.json'.format(T), causes, results, idlist, T)
+        with open(config.data_npy_dict + 'sys_UserCause_{}_PathId.test.json'.format(T), 'w') as f:
             json.dump(newIdlist, f)
 
-    if not os.path.exists(config.data_concept_dict + '{}_UserHops_{}_triple.train.json'.format(ScaleType, T)):
-        usergraph = directed_triple(config.data_npy_dict + '{}_UserCause_{}_Path.train.json'.format(ScaleType, T),
-                        config.data_concept_dict + '{}_UserHops_{}_triple.train.json'.format(ScaleType, T))
+    if not os.path.exists(config.data_concept_dict + 'sys_UserHops_{}_triple.train.json'.format(T)):
+        usergraph = directed_triple(config.data_npy_dict + 'sys_UserCause_{}_Path.train.json'.format(T),
+                        config.data_concept_dict + 'sys_UserHops_{}_triple.train.json'.format(T))
     else:
-        usergraph = read_json(config.data_concept_dict + '{}_UserHops_{}_triple.train.json'.format(ScaleType, T))
-    with open(config.data_npy_dict + '{}_UserCause_{}_PathId.train.json'.format(ScaleType, T), 'r') as f:
+        usergraph = read_json(config.data_concept_dict + 'sys_UserHops_{}_triple.train.json'.format(T))
+    with open(config.data_npy_dict + 'sys_UserCause_{}_PathId.train.json'.format(T), 'r') as f:
         data_train['graphidx'] = json.load(f)
 
     data_train['graphs'] = usergraph
 
     assert len(data_train['target']) == len(data_train['graphidx'])
 
-    if not os.path.exists(config.data_concept_dict + '{}_UserHops_{}_triple.valid.json'.format(ScaleType, T)):
-        usergraph = directed_triple(config.data_npy_dict + '{}_UserCause_{}_Path.valid.json'.format(ScaleType, T),
-                        config.data_concept_dict + '{}_UserHops_{}_triple.valid.json'.format(ScaleType, T))
+    if not os.path.exists(config.data_concept_dict + 'sys_UserHops_{}_triple.valid.json'.format(T)):
+        usergraph = directed_triple(config.data_npy_dict + 'sys_UserCause_{}_Path.valid.json'.format(T),
+                        config.data_concept_dict + 'sys_UserHops_{}_triple.valid.json'.format(T))
     else:
 
-        usergraph = read_json(config.data_concept_dict + '{}_UserHops_{}_triple.valid.json'.format(ScaleType, T))
-    with open(config.data_npy_dict + '{}_UserCause_{}_PathId.valid.json'.format(ScaleType, T), 'r') as f:
+        usergraph = read_json(config.data_concept_dict + 'sys_UserHops_{}_triple.valid.json'.format(T))
+    with open(config.data_npy_dict + 'sys_UserCause_{}_PathId.valid.json'.format(T), 'r') as f:
         data_dev['graphidx'] = json.load(f)
 
     data_dev['graphs'] = usergraph
 
     assert len(data_dev['target']) == len(data_dev['graphidx'])
 
-    if not os.path.exists(config.data_concept_dict + '{}_UserHops_{}_triple.test.json'.format(ScaleType, T)):
-        usergraph = directed_triple(config.data_npy_dict + '{}_UserCause_{}_Path.test.json'.format(ScaleType, T),
-                        config.data_concept_dict + '{}_UserHops_{}_triple.test.json'.format(ScaleType, T))
+    if not os.path.exists(config.data_concept_dict + 'sys_UserHops_{}_triple.test.json'.format(T)):
+        usergraph = directed_triple(config.data_npy_dict + 'sys_UserCause_{}_Path.test.json'.format(T),
+                        config.data_concept_dict + 'sys_UserHops_{}_triple.test.json'.format(T))
     else:
-        usergraph = read_json(config.data_concept_dict + '{}_UserHops_{}_triple.test.json'.format(ScaleType, T))
-    with open(config.data_npy_dict + '{}_UserCause_{}_PathId.test.json'.format(ScaleType, T), 'r') as f:
+        usergraph = read_json(config.data_concept_dict + 'sys_UserHops_{}_triple.test.json'.format(T))
+    with open(config.data_npy_dict + 'sys_UserCause_{}_PathId.test.json'.format(T), 'r') as f:
         data_test['graphidx'] = json.load(f)
 
     data_test['graphs'] = usergraph

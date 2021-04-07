@@ -6,12 +6,12 @@ import numpy as np
 import math
 from models.common_layer import EncoderLayer, DecoderLayer, LayerNorm , \
     _gen_bias_mask ,_gen_timing_signal, share_embedding, LabelSmoothing, NoamOpt, \
-    _get_attn_subsequent_mask,  get_input_from_batch, get_output_from_batch, \
-    top_k_top_p_filtering, PositionwiseFeedForward, gaussian_kld
+    _get_attn_subsequent_mask,  get_input_from_batch, get_graph_from_batch, get_output_from_batch
 import config
 import pprint
 pp = pprint.PrettyPrinter(indent=1)
 import os
+from torch_scatter import scatter_max, scatter_mean, scatter_add
 from sklearn.metrics import accuracy_score
 
 torch.manual_seed(0)
@@ -80,7 +80,6 @@ class Encoder(nn.Module):
 
             for i in range(self.num_layers):
                 x = self.enc[i](x, mask)
-                # x = torch.mul(self.enc[i](x, mask), cazprob + 1)
 
             y = self.layer_norm(x)
 
@@ -119,7 +118,7 @@ class Decoder(nn.Module):
         self.num_layers = num_layers
         self.timing_signal = _gen_timing_signal(max_length, hidden_size)
 
-        if (self.universal):
+        if self.universal:
             self.position_signal = _gen_timing_signal(num_layers, hidden_size)
 
         self.mask = _get_attn_subsequent_mask(max_length)
@@ -134,7 +133,7 @@ class Decoder(nn.Module):
                   attention_dropout,
                   relu_dropout)
 
-        if (self.universal):
+        if self.universal:
             self.dec = DecoderLayer(*params)
         else:
             self.dec = nn.Sequential(*[DecoderLayer(*params) for l in range(num_layers)])
@@ -150,8 +149,8 @@ class Decoder(nn.Module):
         x = self.input_dropout(inputs)
         x = self.embedding_proj(x)
 
-        if (self.universal):
-            if (config.act):
+        if self.universal:
+            if config.act:
                 x, attn_dist, (self.remainders, self.n_updates) = self.act_fn(x, inputs, self.dec, self.timing_signal,
                                                                               self.position_signal, self.num_layers,
                                                                               encoder_output, decoding=True)
@@ -185,76 +184,52 @@ class Generator(nn.Module):
         logit = self.proj(x)
         return F.log_softmax(logit,dim=-1)
 
-class CLSTM(nn.Module):
-    def __init__(self, embed_size):
-        super(CLSTM, self).__init__()
-        self.cause_lstm_1 = nn.GRU(embed_size, config.cause_hidden_dim, batch_first=True, bidirectional=True)
-        self.cause_linear_1 = nn.Linear(config.cause_hidden_dim * 2, config.cause_hidden_dim, bias=False)
-        self.cause_lstm_2 = nn.GRU(config.cause_hidden_dim, config.hidden_dim, batch_first=True, bidirectional=True)
-        self.cause_linear_2 = nn.Linear(config.hidden_dim * 2, config.hidden_dim, bias=False)
 
-    def forward(self, cause_batch):
-        batch_size = cause_batch.size(0)
-        cause_doc = cause_batch.size(1)
-        cause_seq = cause_batch.size(2)
-        cause_batch = cause_batch.reshape(-1, cause_seq, cause_batch.size(-1))
-        _, cause_hid = self.cause_lstm_1(cause_batch)
-        cause_hid = torch.cat((cause_hid[-1], cause_hid[-2]), dim=-1)
-        cause_hid = self.cause_linear_1(cause_hid)
-        cause_hid = cause_hid.reshape(batch_size, cause_doc, -1)
-        _, encoded_cause = self.cause_lstm_2(cause_hid)
-        encoded_cause = torch.cat((encoded_cause[-1], encoded_cause[-2]), dim=-1)
-        encoded_cause = self.cause_linear_2(encoded_cause)  # batch_size, hidden_size
-
-        return encoded_cause
-
-class CauseLSTM(nn.Module):
-    def __init__(self, vocab, decoder_number, model_file_path=None, load_optim=False):
+class Effect(nn.Module):
+    def __init__(self, vocab, decoder_number, act_num=8, model_file_path=None, load_optim=False):
         """
         vocab: a Lang type data, which is defined in data_reader.py
         decoder_number: the number of classes
         """
-        super(CauseLSTM, self).__init__()
+        super(Effect, self).__init__()
         self.iter = 0
         self.current_loss = 1000
+        self.device = config.device
         self.vocab = vocab
         self.vocab_size = vocab.n_words
+        self.act_num = act_num
 
-        self.embedding = share_embedding(self.vocab, config.pretrain_emb)
-        posembedding = torch.FloatTensor(np.load(config.posembedding_path, allow_pickle=True))
-        self.causeposembeding = nn.Embedding.from_pretrained(posembedding, freeze=True)
+        self.embedding = share_embedding(self.vocab, config.emb_dim, config.PAD_idx, config.pretrain_emb)
 
-        self.cause_encoder = CLSTM(config.emb_dim)
         self.encoder = Encoder(config.emb_dim, config.hidden_dim, num_layers=config.hop, num_heads=config.heads,
                                total_key_depth=config.depth, total_value_depth=config.depth,
                                filter_size=config.filter, universal=config.universal)
+
         self.decoder = Decoder(config.emb_dim, hidden_size=config.hidden_dim, num_layers=config.hop,
                                num_heads=config.heads,
                                total_key_depth=config.depth, total_value_depth=config.depth,
                                filter_size=config.filter)
+
         self.decoder_key = nn.Linear(config.hidden_dim, decoder_number, bias=False)
+        self.act_decoder = nn.Linear(config.hidden_dim, act_num, bias=False)
         self.generator = Generator(config.hidden_dim, self.vocab_size)
 
         if config.weight_sharing:
             self.generator.proj.weight = self.embedding.lut.weight
 
         self.criterion = nn.NLLLoss(ignore_index=config.PAD_idx)
-        if (config.label_smoothing):
+        if config.label_smoothing:
             self.criterion = LabelSmoothing(size=self.vocab_size, padding_idx=config.PAD_idx, smoothing=0.1)
             self.criterion_ppl = nn.NLLLoss(ignore_index=config.PAD_idx)
 
-        if (config.noam):
+        if config.noam:
             optimizer = torch.optim.Adam(self.parameters(), lr=0, weight_decay=config.weight_decay, betas=(0.9, 0.98),
                                          eps=1e-9)
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                             milestones=[config.schedule * i for i in range(4)],
-                                                             gamma=0.1)
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[config.schedule*i for i in range(4)], gamma=0.1)
             self.scheduler = NoamOpt(config.hidden_dim, 1, 8000, optimizer, scheduler)
         else:
             self.optimizer = torch.optim.Adam(self.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer,
-                                                                  milestones=[config.schedule * i for i in range(4)],
-                                                                  gamma=0.1)
+            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=[config.schedule*i for i in range(4)], gamma=0.1)
 
         if model_file_path is not None:
             print("loading weights")
@@ -263,12 +238,14 @@ class CauseLSTM(nn.Module):
             self.current_loss = state['current_loss']
             self.embedding.load_state_dict(state['embedding_dict'])
             self.encoder.load_state_dict(state['encoder_state_dict'])
-            self.cause_encoder.load_state_dict(state['cause_encoder_dict'])
             self.decoder.load_state_dict(state['decoder_state_dict'])
             self.generator.load_state_dict(state['generator_dict'])
             self.decoder_key.load_state_dict(state['decoder_key_state_dict'])
-            if (load_optim):
-                self.scheduler.load_state_dict(state['optimizer'])
+            if load_optim:
+                try:
+                    self.scheduler.load_state_dict(state['optimizer'])
+                except AttributeError:
+                    pass
 
         self.model_dir = config.save_path
         if not os.path.exists(self.model_dir):
@@ -278,79 +255,67 @@ class CauseLSTM(nn.Module):
     def save_model(self, running_avg_ppl, iter, f1_g, f1_b, ent_g, ent_b):
         self.iter = iter
         state = {
-            'iter': iter,
+            'iter': self.iter,
             'encoder_state_dict': self.encoder.state_dict(),
-            'cause_encoder_dict': self.cause_encoder.state_dict(),
             'decoder_state_dict': self.decoder.state_dict(),
+            'act_decoder_dict': self.decoder_key.state_dict(),
             'generator_dict': self.generator.state_dict(),
             'decoder_key_state_dict': self.decoder_key.state_dict(),
             'embedding_dict': self.embedding.state_dict(),
             'optimizer': self.scheduler.state_dict(),
             'current_loss': running_avg_ppl
         }
-        model_save_path = os.path.join(self.model_dir,
-                'model_{}_{:.4f}_{:3f}_{:3f}'.format(iter, running_avg_ppl, ent_g, ent_b))
+
+        model_save_path = os.path.join(self.model_dir, 'model_{}_{:.4f}'.format(
+            iter, running_avg_ppl))
         self.best_path = model_save_path
         torch.save(state, model_save_path)
 
-    def train_one_batch(self, batch, train=True):
-        enc_batch, cause_batch = get_input_from_batch(batch)
-        dec_batch, _ = get_output_from_batch(batch)
-
-        if (config.noam):
+    def train_one_batch(self, batch, iter, train=True):
+        enc_batch, _ = get_input_from_batch(batch)
+        dec_batch, dec_lengths, _ = get_output_from_batch(batch)
+        target_act = batch["target_act"].to(self.device)
+        if config.noam:
             self.scheduler.optimizer.zero_grad()
         else:
             self.optimizer.zero_grad()
 
-        ## Encode
+        ## encode
         mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
-        emb_mask = self.embedding(batch["mask_input"])
-        causepos = self.causeposembeding(batch["causepos"])
-        encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mask + causepos,
+        emb_mak = self.embedding(batch["mask_input"])
+        encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mak,
                                        mask_src)
+        q_h = encoder_outputs[:, 0]  # the first token of the sentence CLS, shape: (batch_size, 1, hidden_size)
 
-        ## encode cause
-        if cause_batch.size(-1):
-            encoded_cause = self.cause_encoder(self.embedding(cause_batch))
-
-        ## Decode
-        sos_token = torch.LongTensor([config.SOS_idx] * enc_batch.size(0)).unsqueeze(1).to(config.device)
+        ## decode
+        sos_token = torch.LongTensor([config.SOS_idx] * enc_batch.size(0)).unsqueeze(1).to(self.device)
         dec_batch_shift = torch.cat((sos_token, dec_batch[:, :-1]), 1)
         mask_trg = dec_batch_shift.data.eq(config.PAD_idx).unsqueeze(1)
         dec_input = self.embedding(dec_batch_shift)
-        if cause_batch.size(-1):
-            dec_input[:, 0] = dec_input[:, 0] + encoded_cause
 
+        ## logit and graph processing
         pre_logit, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
-
-        logit = self.generator(pre_logit)
+        act_distribute = F.log_softmax(self.act_decoder(pre_logit))
+        logit = self.generator(pre_logit).to(self.device)
 
         loss = self.criterion(logit.contiguous().view(-1, logit.size(-1)), dec_batch.contiguous().view(-1))
-
-        loss_bce_program, loss_bce_caz, program_acc = 0, 0, 0
-
         # multi-task
-        if config.emo_multitask:
-            # add the loss function of label prediction
-            # q_h = torch.mean(encoder_outputs,dim=1)
-            q_h = encoder_outputs[:, 0]  # the first token of the sentence CLS, shape: (batch_size, 1, hidden_size)
-            logit_prob = self.decoder_key(q_h).to(config.device)  # (batch_size, 1, decoder_num)
-            loss += nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).cuda())
 
-            loss_bce_program = nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).cuda()).item()
-            pred_program = np.argmax(logit_prob.detach().cpu().numpy(), axis=1)
-            program_acc = accuracy_score(batch["program_label"], pred_program)
+        logit_prob = self.decoder_key(q_h).to(self.device)  # (batch_size, 1, decoder_num)
+        loss += nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).to(self.device))
+        loss += nn.CrossEntropyLoss(ignore_index=-1)(act_distribute.view(-1, self.act_num), target_act.view(-1, ))
+        loss_bce_program = nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).to(self.device)).item()
+        pred_program = np.argmax(logit_prob.detach().cpu().numpy(), axis=1)
+        program_acc = accuracy_score(batch["program_label"], pred_program)
 
-
-
-        if (config.label_smoothing):
+        if config.label_smoothing:
             loss_ppl = self.criterion_ppl(logit.contiguous().view(-1, logit.size(-1)),
                                           dec_batch.contiguous().view(-1)).item()
 
-        if (train):
+        if train:
             loss.backward()
             self.scheduler.step()
-        if (config.label_smoothing):
+        if config.label_smoothing:
             return loss_ppl, math.exp(min(loss_ppl, 100)), loss_bce_program, program_acc
         else:
             return loss.item(), math.exp(min(loss.item(), 100)), loss_bce_program, program_acc
@@ -364,35 +329,26 @@ class CauseLSTM(nn.Module):
         return loss
 
     def decoder_greedy(self, batch, max_dec_step=30):
-        enc_batch, cause_batch = get_input_from_batch(batch)
+        enc_batch, _ = get_input_from_batch(batch)
 
         mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
         emb_mask = self.embedding(batch["mask_input"])
-        causepos = self.causeposembeding(batch["causepos"])
-        encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mask + causepos,
+        encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mask,
                                        mask_src)
 
-        ## cause_encoder
-        if cause_batch.size(-1):
-            encoded_cause = self.cause_encoder(self.embedding(cause_batch))
-
-        ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(config.device)
+        ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(self.device)
         mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
         decoded_words = []
         for i in range(max_dec_step + 1):
             dec_input = self.embedding(ys)
-            if cause_batch.size(-1):
-                dec_input[:, 0] = dec_input[:, 0] + encoded_cause
-
             out, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
-
             prob = self.generator(out)
             _, next_word = torch.max(prob[:, -1], dim=1)
             decoded_words.append(['<EOS>' if ni.item() == config.EOS_idx else self.vocab.index2word[ni.item()] for ni in
                                   next_word.view(-1)])
             next_word = next_word.data[0]
 
-            ys = torch.cat([ys, torch.ones(1, 1).long().fill_(next_word).to(config.device)], dim=1).to(config.device)
+            ys = torch.cat([ys, torch.ones(1, 1).long().fill_(next_word).to(self.device)], dim=1).to(self.device)
 
             mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
 
@@ -421,17 +377,17 @@ class ACT_basic(nn.Module):
     def forward(self, state, inputs, fn, time_enc, pos_enc, max_hop, encoder_output=None, decoding=False):
         # init_hdd
         ## [B, S]
-        halting_probability = torch.zeros(inputs.shape[0],inputs.shape[1]).cuda()
+        halting_probability = torch.zeros(inputs.shape[0],inputs.shape[1]).to(config.device)
         ## [B, S]
-        remainders = torch.zeros(inputs.shape[0],inputs.shape[1]).cuda()
+        remainders = torch.zeros(inputs.shape[0],inputs.shape[1]).to(config.device)
         ## [B, S]
-        n_updates = torch.zeros(inputs.shape[0],inputs.shape[1]).cuda()
+        n_updates = torch.zeros(inputs.shape[0],inputs.shape[1]).to(config.device)
         ## [B, S, HDD]
-        previous_state = torch.zeros_like(inputs).cuda()
+        previous_state = torch.zeros_like(inputs).to(config.device)
 
         step = 0
         # for l in range(self.num_layers):
-        while( ((halting_probability<self.threshold) & (n_updates < max_hop)).byte().any()):
+        while ((halting_probability<self.threshold) & (n_updates < max_hop)).byte().any():
             # as long as there is a True value, the loop continues
             # Add timing signal
             state = state + time_enc[:, :inputs.shape[1], :].type_as(inputs.data)
@@ -466,7 +422,7 @@ class ACT_basic(nn.Module):
             # the remainders when it halted this step
             update_weights = p * still_running + new_halted * remainders
 
-            if(decoding):
+            if decoding:
                 state, _, attention_weight = fn((state,encoder_output,[]))
             else:
                 # apply transformation on the state
@@ -474,15 +430,15 @@ class ACT_basic(nn.Module):
 
             # update running part in the weighted state and keep the rest
             previous_state = ((state * update_weights.unsqueeze(-1)) + (previous_state * (1 - update_weights.unsqueeze(-1))))
-            if(decoding):
-                if(step==0):  previous_att_weight = torch.zeros_like(attention_weight).cuda()      ## [B, S, src_size]
+            if decoding:
+                if(step==0):  previous_att_weight = torch.zeros_like(attention_weight).to(config.device)     ## [B, S, src_size]
                 previous_att_weight = ((attention_weight * update_weights.unsqueeze(-1)) + (previous_att_weight * (1 - update_weights.unsqueeze(-1))))
             ## previous_state is actually the new_state at end of hte loop
             ## to save a line I assigned to previous_state so in the next
             ## iteration is correct. Notice that indeed we return previous_state
             step+=1
 
-        if(decoding):
+        if decoding:
             return previous_state, previous_att_weight, (remainders,n_updates)
         else:
             return previous_state, (remainders,n_updates)

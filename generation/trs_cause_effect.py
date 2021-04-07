@@ -372,18 +372,19 @@ class GCNLSTM(nn.Module):
         encoded_cause = torch.tanh(encoded_cause)
         return encoded_cause
 
-class MultiHopCause(nn.Module):
-    def __init__(self, vocab, decoder_number, model_file_path=None, load_optim=False):
+class CauseEffect(nn.Module):
+    def __init__(self, vocab, decoder_number, act_num=8, model_file_path=None, load_optim=False):
         """
         vocab: a Lang type data, which is defined in data_reader.py
         decoder_number: the number of classes
         """
-        super(MultiHopCause, self).__init__()
+        super(CauseEffect, self).__init__()
         self.iter = 0
         self.current_loss = 1000
         self.device = config.device
         self.vocab = vocab
         self.vocab_size = vocab.n_words
+        self.act_num = act_num
 
         self.embedding = share_embedding(self.vocab, config.emb_dim, config.PAD_idx, config.pretrain_emb)
         posembedding = torch.FloatTensor(np.load(config.posembedding_path, allow_pickle=True))
@@ -401,6 +402,8 @@ class MultiHopCause(nn.Module):
                                filter_size=config.filter)
 
         self.decoder_key = nn.Linear(config.hidden_dim, decoder_number, bias=False)
+        # self.act_decoder = nn.Linear(config.hidden_dim, act_num, bias=False)
+        self.discrimator = nn.Linear(config.hidden_dim, 1, bias=False)
         self.generator = Generator(config.hidden_dim, self.vocab_size)
 
         if config.weight_sharing:
@@ -452,6 +455,7 @@ class MultiHopCause(nn.Module):
             'generator_dict': self.generator.state_dict(),
             'decoder_key_state_dict': self.decoder_key.state_dict(),
             'embedding_dict': self.embedding.state_dict(),
+            'discrimator_dict': self.discrimator.state_dict(),
             'optimizer': self.scheduler.state_dict(),
             'current_loss': running_avg_ppl
         }
@@ -464,7 +468,7 @@ class MultiHopCause(nn.Module):
     def train_one_batch(self, batch, iter, train=True):
         enc_batch, cause_batch = get_input_from_batch(batch)
         graphs, graph_num = get_graph_from_batch(batch)
-        dec_batch, dec_lengths = get_output_from_batch(batch)
+        dec_batch, dec_lengths, dec_fakes = get_output_from_batch(batch)
         if config.noam:
             self.scheduler.optimizer.zero_grad()
         else:
@@ -476,6 +480,7 @@ class MultiHopCause(nn.Module):
         causepos = self.causeposembeding(batch["causepos"])
         encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mak + causepos,
                                        mask_src)
+        q_h = encoder_outputs[:, 0]  # the first token of the sentence CLS, shape: (batch_size, 1, hidden_size)
 
         ## decode
         sos_token = torch.LongTensor([config.SOS_idx] * enc_batch.size(0)).unsqueeze(1).to(self.device)
@@ -483,12 +488,14 @@ class MultiHopCause(nn.Module):
         mask_trg = dec_batch_shift.data.eq(config.PAD_idx).unsqueeze(1)
         dec_input = self.embedding(dec_batch_shift)
 
+
         ## logit and graph processing
         if torch.sum(graph_num):
             concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask = graphs
             triple_repr, cause_repr = self.glstm.comp_cause(concept_ids, relation, head, tail, triple_label)
             dec_input[:, 0] = dec_input[:, 0] + cause_repr
             pre_logit, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
+
             logit = self.generator(pre_logit)
             gate, cpt_probs_vocab = self.glstm.comp_pointer(pre_logit, concept_label, distance, head, tail, triple_repr,
                                 triple_label, vocab_map, map_mask)
@@ -500,12 +507,28 @@ class MultiHopCause(nn.Module):
 
         loss = self.criterion(logit.contiguous().view(-1, logit.size(-1)), dec_batch.contiguous().view(-1))
         # multi-task
+        if train:
+            fake_target, fake_lengths = dec_fakes
+            bz, fake_num = fake_target.size(0), fake_target.size(1)
+            labels = torch.zeros_like(fake_lengths).to(self.device)
+            labels[:, 0] = 1
+            fake_target = fake_target.view(bz*fake_num, -1)
+            fake_target_shift = torch.cat((sos_token.repeat(fake_num, 1), fake_target[:, :-1]), 1)
+            mask_fake = fake_target_shift.data.eq(config.PAD_idx).unsqueeze(1)
+            fake_input = self.embedding(fake_target_shift)
+            if torch.sum(graph_num):
+                fake_input[:, 0] = fake_input[:, 0] + cause_repr.repeat(fake_num, 1, 1)
+            pre_logit_fake, _ = self.decoder(fake_input, encoder_outputs.repeat(fake_num, 1, 1), (mask_src.repeat(fake_num, 1, 1), mask_fake))
 
-        q_h = encoder_outputs[:, 0]  # the first token of the sentence CLS, shape: (batch_size, 1, hidden_size)
-        logit_prob = self.decoder_key(q_h).to(self.device)  # (batch_size, 1, decoder_num)
-        loss += nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label'], device=self.device))
+            pre_logit_fake = pre_logit_fake.gather(1, fake_lengths.view(bz*fake_num, 1, 1).repeat(1, 1, config.emb_dim)).squeeze(1)
+            logit_fake = nn.Sigmoid()(self.discrimator(pre_logit_fake).view(bz, fake_num))
+            logit_fake = F.softmax(logit_fake, -1)
+            loss += nn.BCELoss()(logit_fake.view(bz*fake_num), labels.view(bz*fake_num).float())
 
-        loss_bce_program = nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label'], device=self.device)).item()
+        logit_prob = self.decoder_key(q_h)  # (batch_size, 1, decoder_num)
+        loss += nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).to(self.device))
+
+        loss_bce_program = nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).to(self.device)).item()
         pred_program = np.argmax(logit_prob.detach().cpu().numpy(), axis=1)
         program_acc = accuracy_score(batch["program_label"], pred_program)
 

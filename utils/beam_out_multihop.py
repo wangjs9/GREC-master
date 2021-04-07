@@ -1,11 +1,7 @@
-""" Manage beam search info structure.
-    Heavily borrowed from OpenNMT-py.
-    For code in OpenNMT-py, please check the following link:
-    https://github.com/OpenNMT/OpenNMT-py/blob/master/onmt/Beam.py
-"""
-
 import torch
+import numpy as np
 import config
+
 
 class Beam():
     ''' Beam search '''
@@ -155,39 +151,24 @@ class Translator(object):
                 dec_partial_seq = dec_partial_seq.view(-1, len_dec_seq)
                 return dec_partial_seq
 
-            def predict_word(dec_seq, enc_output, n_active_inst, n_bm, mask_src, other_info=()):
+            def predict_word(dec_seq, enc_output, n_active_inst, n_bm, mask_src, other_info):
                 ## masking
                 mask_trg = dec_seq.data.eq(config.PAD_idx).unsqueeze(1)
                 mask_src = torch.cat([mask_src[0].unsqueeze(0)] * mask_trg.size(0), 0)
-                dec_input = self.model.embedding(dec_seq)
-                if config.model == 'w.o/refer':
-                    if other_info != ():
-                        dec_input[:, 0] = dec_input[:, 0] + other_info[0]
+                if other_info != None:
+                    cause_repr, concept_label, distance, head, tail, triple_repr, triple_label, vocab_map, map_mask = other_info
+                    dec_input = self.model.embedding(dec_seq)
+                    dec_input[:, 0] = dec_input[:, 0] + cause_repr
                     out, attn_dist = self.model.decoder(dec_input, enc_output, (mask_src, mask_trg))
-                    prob = self.model.generator(out)
-                elif config.model == 'w.o/encoder':
-                    out, attn_dist = self.model.decoder(dec_input, enc_output, (mask_src, mask_trg))
-                    prob = self.model.generator(out)
-                    if other_info != ():
-                        bz = out.size(0)
-                        cause_repr, concept_label, distance, head, tail, triple_repr, triple_label, vocab_map, map_mask = other_info
-                        gate, cpt_probs_vocab = self.model.glstm.comp_pointer(out, torch.cat([concept_label for i in range(bz)], axis=0), torch.cat([distance for i in range(bz)], axis=0),
+                    bz = out.size(0)
+                    gate, cpt_probs_vocab = self.model.glstm.comp_pointer(out, torch.cat([concept_label for i in range(bz)], axis=0), torch.cat([distance for i in range(bz)], axis=0),
                                                                           torch.cat([head for i in range(bz)], axis=0), torch.cat([tail for i in range(bz)], axis=0),
                                                                           torch.cat([triple_repr for i in range(bz)], axis=0), torch.cat([triple_label for i in range(bz)], axis=0),
                                                                           torch.cat([vocab_map for i in range(bz)], axis=0), torch.cat([map_mask for i in range(bz)], axis=0))
-                        prob = prob * (1 - gate) + gate * cpt_probs_vocab
-                elif config.model == 'w.o/graph':
-                    cause_repr, concept_ids, concept_label, vocab_map, map_mask = other_info
-                    if cause_repr != None:
-                        dec_input[:, 0] = dec_input[:, 0] + cause_repr
-                    out, attn_dist = self.model.decoder(dec_input, enc_output, (mask_src, mask_trg))
-                    prob = self.model.generator(out)
-                    if concept_ids != None:
-                        bz = out.size(0)
-                        gate, cpt_probs_vocab = self.model.refer(out, torch.cat([concept_ids for i in range(bz)], axis=0), torch.cat([concept_label for i in range(bz)], axis=0), torch.cat([vocab_map for i in range(bz)], axis=0), torch.cat([map_mask for i in range(bz)], axis=0))
-                        prob = prob * (1 - gate) + gate * cpt_probs_vocab
+                    prob = self.model.generator(out) * (1 - gate) + gate * cpt_probs_vocab
                 else:
-                    out, attn_dist = self.model.decoder(dec_input, enc_output, (mask_src, mask_trg))
+                    out, attn_dist = self.model.decoder(self.model.embedding(dec_seq), enc_output,
+                                                           (mask_src, mask_trg))
                     prob = self.model.generator(out)
 
                 word_prob = prob[:, -1]
@@ -228,24 +209,18 @@ class Translator(object):
 
             mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
             emb_mask = self.model.embedding(batch["mask_input"])
-            src_enc = self.model.encoder(self.model.embedding(enc_batch) + emb_mask, mask_src)
-            other_info = ()
+            causepos = self.model.causeposembeding(batch["causepos"])
+            src_enc = self.model.encoder(self.model.embedding(enc_batch) + emb_mask + causepos, mask_src)
+
             graphs, use_graph = get_graph_from_batch(batch)
-            if config.model == 'w.o/refer' or config.model == 'w.o/encoder':
-                if use_graph:
-                    concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask = graphs
-                    triple_repr, cause_repr = self.model.glstm.comp_cause(concept_ids, relation, head, tail, triple_label)
-                    other_info = (cause_repr, concept_label, distance, head, tail, triple_repr, triple_label, vocab_map, map_mask)
-            elif config.model == 'w.o/graph':
-                if cause_batch.size(-1):
-                    cause_repr = self.model.cause_encoder(self.model.embedding(cause_batch))
-                else:
-                    cause_repr = None
-                if use_graph:
-                    concept_ids, concept_label, _, _, _, _, _, vocab_map, map_mask = graphs
-                else:
-                    concept_ids, concept_label, vocab_map, map_mask = None, None, None, None
-                other_info = (cause_repr, concept_ids, concept_label, vocab_map, map_mask)
+            if use_graph:
+                concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask = graphs
+                triple_repr, cause_repr = self.model.glstm.comp_cause(concept_ids, relation, head, tail,
+                                                                       triple_label)
+                other_info = (cause_repr, concept_label, distance, head, tail, triple_repr, triple_label, vocab_map, map_mask)
+            else:
+                other_info = None
+
             # -- Repeat data for beam search
             n_bm = self.beam_size
             n_inst, len_s, d_h = src_enc.size()
@@ -309,7 +284,6 @@ def get_input_from_batch(batch):
 
     return enc_batch, enc_padding_mask, enc_lens, c_t_1, cause_batch
 
-
 def get_graph_from_batch(batch):
     concept_ids = batch["concept_ids"]
     concept_label = batch["concept_label"]
@@ -326,3 +300,4 @@ def get_graph_from_batch(batch):
     else:
         use_graph = True
     return (concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask), use_graph
+

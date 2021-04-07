@@ -12,7 +12,7 @@ import argparse, os, torch
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='empathetic_dialogues', help='`empathetic_dialogues`, `cornell_movie` or `dailydialog`')
-parser.add_argument("--model", type=str, default="multihop", help='model can be one of `trs`, `cause`, `strategy`, and `multihop`')
+parser.add_argument("--model", type=str, default="cause-effect", help='model can be one of `cause-effect`, `act`, `s2s `, `trs`, `w.o/refer`, `w.o/encoder`, `w.o/graph`,`multiexpert`, `mime`, and `multihop`')
 dataset = parser.parse_args().dataset
 if dataset not in ['empathetic_dialogues', 'cornell_movie', 'dailydialog']:
     raise ValueError('dataste not be one of `empathetic_dialogues`, `cornell_movie` or `dailydialog`')
@@ -29,32 +29,36 @@ parser.add_argument('--concept_rel', type=str, default='', help='name of concept
 parser.add_argument('--conceptnet', type=str, default='', help='name of conceptnet file')
 parser.add_argument('--conceptnet_graph', type=str, default='', help='name of conceptnet graph file')
 parser.add_argument('--triple_dict', type=str, default='', help='name of conceptnet graph file')
+parser.add_argument("--emo_combine", type=str, default="gate", help="can be `gate` or `attn`")
+parser.add_argument("--emo_input", type=str, default="self_att", help="can be `cross_att` or `self_att`") # cross_att; self_att
+parser.add_argument("--decoder", type=str, default="single") # single
 
 parser.add_argument("--hidden_dim", type=int, default=300)
 parser.add_argument("--cause_hidden_dim", type=int, default=128)
 parser.add_argument("--emb_dim", type=int, default=300)
-parser.add_argument('--bz', type=int, default=32, help='the size of batch')
-parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
-parser.add_argument('--schedule', type=int, default=500, help='schedule step')
-parser.add_argument('--weight_decay', type=float, default=5e-6, help='weight decay rate')
+parser.add_argument('--bz', type=int, default=16, help='the size of batch')
+parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
+parser.add_argument('--schedule', type=int, default=5000, help='schedule step') # 10000
 parser.add_argument('--gs', type=int, default=10000, help='total number of global steps')
 parser.add_argument("--beam_size", type=int, default=5)
-
-parser.add_argument("--weight_sharing", type=bool, default=True)#action="store_true")
-parser.add_argument("--label_smoothing", type=bool, default=True)#, action="store_true")
-parser.add_argument("--noam", type=bool, default=True)#action="store_true")
-parser.add_argument("--universal", type=bool, default=True)#action="store_true")
-parser.add_argument("--emo_multitask", type=bool, default=True)#action="store_true")
+parser.add_argument("--topk", type=int, default=5)
+parser.add_argument("--softmax", type=bool, default=True)
+parser.add_argument("--oracle", type=bool, default=False)
+parser.add_argument("--weight_sharing", type=bool, default=True)
+parser.add_argument("--label_smoothing", type=bool, default=True)
+parser.add_argument("--noam", type=bool, default=True)
+parser.add_argument("--universal", type=bool, default=True)
+parser.add_argument("--emo_multitask", type=bool, default=True)
 parser.add_argument("--cause_multitask", action="store_true")
-parser.add_argument("--act", type=bool, default=True)#action="store_true")
+parser.add_argument("--act", type=bool, default=True)
 parser.add_argument("--act_loss_weight", type=float, default=0.001)
-parser.add_argument("--pretrain_emb", type=bool, default=True)#action="store_true")
-parser.add_argument("--test", type=bool, default=False)#action="store_true")
+parser.add_argument("--pretrain_emb", type=bool, default=True)
+parser.add_argument("--test", type=bool, default=False)
 
 
 ## transformer
-parser.add_argument("--hop", type=int, default=6)
-parser.add_argument("--heads", type=int, default=8)
+parser.add_argument("--hop", type=int, default=6)   # 1
+parser.add_argument("--heads", type=int, default=8) # 8
 parser.add_argument("--depth", type=int, default=40)
 parser.add_argument("--filter", type=int, default=50)
 
@@ -84,6 +88,7 @@ model = arg.model
 emb_dim = arg.emb_dim
 hidden_dim = arg.hidden_dim
 cause_hidden_dim = arg.cause_hidden_dim
+topk = arg.topk
 ### transformer
 hop = arg.hop
 heads = arg.heads
@@ -99,7 +104,11 @@ act = arg.act
 act_loss_weight = arg.act_loss_weight
 emo_multitask = arg.emo_multitask
 cause_multitask = arg.cause_multitask
-
+softmax = arg.softmax
+oracle = arg.oracle
+emo_combine = arg.emo_combine
+emo_input = arg.emo_input
+decoder = arg.decoder
 # >>>>>>>>>> data path >>>>>>>>>> #
 dataset = arg.dataset
 data_dict = arg.data_dict
@@ -123,11 +132,7 @@ conceptnet_graph = arg.conceptnet_graph if arg.conceptnet_graph else '../concept
 bz = arg.bz
 lr = arg.lr
 schedule = arg.schedule
-weight_decay = arg.weight_decay
+weight_decay = lr * 0.01
 test = arg.test
 beam_size = arg.beam_size
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-
-
-

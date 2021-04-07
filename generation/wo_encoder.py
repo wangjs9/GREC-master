@@ -6,8 +6,7 @@ import numpy as np
 import math
 from models.common_layer import EncoderLayer, DecoderLayer, LayerNorm , \
     _gen_bias_mask ,_gen_timing_signal, share_embedding, LabelSmoothing, NoamOpt, \
-    _get_attn_subsequent_mask,  get_input_from_batch, get_graph_from_batch, get_output_from_batch, \
-    PositionwiseFeedForward, gaussian_kld
+    _get_attn_subsequent_mask,  get_input_from_batch, get_graph_from_batch, get_output_from_batch
 import config
 import pprint
 pp = pprint.PrettyPrinter(indent=1)
@@ -119,7 +118,7 @@ class Decoder(nn.Module):
         self.num_layers = num_layers
         self.timing_signal = _gen_timing_signal(max_length, hidden_size)
 
-        if (self.universal):
+        if self.universal:
             self.position_signal = _gen_timing_signal(num_layers, hidden_size)
 
         self.mask = _get_attn_subsequent_mask(max_length)
@@ -134,7 +133,7 @@ class Decoder(nn.Module):
                   attention_dropout,
                   relu_dropout)
 
-        if (self.universal):
+        if self.universal:
             self.dec = DecoderLayer(*params)
         else:
             self.dec = nn.Sequential(*[DecoderLayer(*params) for l in range(num_layers)])
@@ -150,8 +149,8 @@ class Decoder(nn.Module):
         x = self.input_dropout(inputs)
         x = self.embedding_proj(x)
 
-        if (self.universal):
-            if (config.act):
+        if self.universal:
+            if config.act:
                 x, attn_dist, (self.remainders, self.n_updates) = self.act_fn(x, inputs, self.dec, self.timing_signal,
                                                                               self.position_signal, self.num_layers,
                                                                               encoder_output, decoding=True)
@@ -186,21 +185,19 @@ class Generator(nn.Module):
         return F.log_softmax(logit,dim=-1)
 
 class GLSTM(nn.Module):
-    def __init__(self, embedding):
+    def __init__(self, embedding, emb_dim, hop_num):
         super(GLSTM, self).__init__()
         self.embedding = embedding
         self.device = config.device
-        self.hop_num = config.hop_num
         self.relation_embd = nn.Embedding(47*2, config.emb_dim)
         self.W_s = nn.ModuleList(
-            [nn.Linear(config.emb_dim, config.emb_dim, bias=False) for _ in range(config.hop_num)])
+            [nn.Linear(emb_dim, emb_dim, bias=False) for _ in range(hop_num)])
         self.W_n = nn.ModuleList(
-            [nn.Linear(config.emb_dim, config.emb_dim, bias=False) for _ in range(config.hop_num)])
+            [nn.Linear(emb_dim, emb_dim, bias=False) for _ in range(hop_num)])
         self.W_r = nn.ModuleList(
-            [nn.Linear(config.emb_dim, config.emb_dim, bias=False) for _ in range(config.hop_num)])
-        self.triple_linear = nn.Linear(config.emb_dim * 3, config.emb_dim, bias=False)
-        self.lstm = GCNLSTM()
-        self.gate_linear = nn.Linear(config.emb_dim, 1)
+            [nn.Linear(emb_dim, emb_dim, bias=False) for _ in range(hop_num)])
+        self.triple_linear = nn.Linear(emb_dim * 3, emb_dim, bias=False)
+        self.gate_linear = nn.Linear(emb_dim, 1)
 
     def multi_layer_gcn(self, concept_hidden, relation_hidden, head, tail, triple_label,
                              layer_number=2):
@@ -288,6 +285,7 @@ class GLSTM(nn.Module):
             out.masked_fill_((concept_label == -1).unsqueeze(1), 0)
 
             concept_probs.append(out)
+
         '''
         Natural decay of concept that is multi-hop away from source
         '''
@@ -311,7 +309,7 @@ class GLSTM(nn.Module):
 
         ## calculate graph
         memory = self.embedding(concept_ids)
-        rel_repr = self.embedding(relation)
+        rel_repr = self.relation_embd(relation)
         node_repr, rel_repr = self.multi_layer_gcn(memory, rel_repr, head, tail, triple_label,
                                                         layer_number=2)
         head_repr = torch.gather(node_repr, 1,
@@ -320,26 +318,26 @@ class GLSTM(nn.Module):
                                  tail.unsqueeze(-1).expand(node_repr.size(0), tail.size(1), node_repr.size(-1)))
         triple_repr = torch.cat((head_repr, rel_repr, tail_repr), dim=-1)
         triple_repr = self.triple_linear(triple_repr)
-
-        encoded_cause = self.lstm(triple_repr.reshape(self.batch_size, self.graph_num, -1, triple_repr.size(-1)))
+        triple_repr = torch.sigmoid(triple_repr)
 
         assert (not torch.isnan(triple_repr).any().item())
 
-        return triple_repr, encoded_cause
+        return triple_repr, None
 
     def comp_pointer(self, hidden_state, concept_label, distance, head, tail, triple_repr, triple_label, vocab_map, map_mask):
+        batch_size = hidden_state.size(0)
         concept_label = concept_label.reshape(-1, concept_label.size(2))
         distance = distance.reshape(-1, distance.size(2))
         head = head.reshape(-1, head.size(2))
         tail = tail.reshape(-1, tail.size(2))
         triple_label = triple_label.reshape(-1, triple_label.size(2))
-        new_hidden_state = hidden_state.unsqueeze(1).expand(-1, self.graph_num, -1, -1).reshape(self.batch_size * self.graph_num, hidden_state.size(1), hidden_state.size(2))
+        new_hidden_state = hidden_state.unsqueeze(1).expand(-1, self.graph_num, -1, -1).reshape(batch_size * self.graph_num, hidden_state.size(1), hidden_state.size(2))
         triple_logits = torch.matmul(new_hidden_state, triple_repr.transpose(1, 2))
         triple_prob = nn.Sigmoid()(triple_logits)
         triple_prob = triple_prob.masked_fill((triple_label == -1).unsqueeze(1), 0)
 
         cpt_probs = self.multi_hop(triple_prob, distance, head, tail, concept_label, triple_label, config.hop_num)
-        cpt_probs = cpt_probs.reshape(self.batch_size, self.graph_num, -1, cpt_probs.size(-1)) # bsz x graph_num x L x mem
+        cpt_probs = cpt_probs.reshape(batch_size, self.graph_num, -1, cpt_probs.size(-1)) # bsz x graph_num x L x mem
         # cpt_probs = cpt_probs.transpose(2, 1).reshape(batch_size, -1, graph_num * cpt_probs.size(-1))
         cpt_probs = F.log_softmax(cpt_probs, dim=-1)
         cpt_probs_vocab = cpt_probs.gather(-1, vocab_map.unsqueeze(2).expand(cpt_probs.size(0),
@@ -349,125 +347,40 @@ class GLSTM(nn.Module):
         # bsz x graph_num x L x vocab
 
         gate = F.log_softmax(self.gate_linear(hidden_state), dim=-1)
+        # gate = self.gate_linear(hidden_state)
         # bsz x L x 1
 
         return gate, cpt_probs_vocab
 
-class GCNLSTM(nn.Module):
-    def __init__(self, embed_size=config.emb_dim):
-        super(GCNLSTM, self).__init__()
-        self.linear = nn.Linear(embed_size,embed_size, bias=False)
-        self.cause_lstm = nn.GRU(embed_size, config.hidden_dim, batch_first=True, bidirectional=True)
-        self.cause_linear = nn.Linear(config.hidden_dim * 2, config.hidden_dim, bias=False)
 
-    def forward(self, cause_batch):
-        cause_batch = torch.sum(cause_batch, dim=-2) # batch_size, graph_num, hidden_size
-        cause_batch = self.linear(cause_batch)
-        _, cause_hid = self.cause_lstm(cause_batch)
-        cause_hid = torch.cat((cause_hid[-1], cause_hid[-2]), dim=-1) # batch_size, hidden_size * 2
-        encoded_cause = self.cause_linear(cause_hid)  # batch_size, hidden_size
-        encoded_cause = torch.tanh(encoded_cause)
-        return encoded_cause
-
-class strategy_CVAE(nn.Module):
-    def __init__(self, hidden_dim=3, filter=5, dropout=0.5):
-        super(strategy_CVAE, self).__init__()
-        self.mean = PositionwiseFeedForward(hidden_dim, filter, hidden_dim,
-                                            layer_config='lll', padding='left', dropout=dropout)
-
-        self.var = PositionwiseFeedForward(hidden_dim, filter, hidden_dim,
-                                           layer_config='lll', padding='left', dropout=dropout)
-
-        self.mean_p = PositionwiseFeedForward(hidden_dim * 2, filter, hidden_dim,
-                                              layer_config='lll', padding='left', dropout=dropout)
-
-        self.var_p = PositionwiseFeedForward(hidden_dim * 2, filter, hidden_dim,
-                                             layer_config='lll', padding='left', dropout=dropout)
-
-    def forward(self, x, x_p):
-        mean = self.mean(x)
-        log_var = self.var(x)
-        eps = torch.randn(x.size()).to(config.device)
-
-        mean_p = self.mean_p(torch.cat((x_p, x), dim=-1))
-        log_var_p = self.var_p(torch.cat((x_p, x), dim=-1))
-        kld_loss = gaussian_kld(mean_p, log_var_p, mean, log_var)
-        kld_loss = torch.mean(kld_loss)
-
-        std = torch.exp(0.5 * log_var_p)
-        z = eps * std + mean_p
-
-        return kld_loss, z
-
-class strategy_decoder(nn.Module):
-    def __init__(self):
-        super(strategy_decoder, self).__init__()
-        self.response_encoder = Encoder(config.emb_dim, config.hidden_dim, num_layers=config.hop,
-                                        num_heads=config.heads,
-                                        max_length=30, total_key_depth=config.depth, total_value_depth=config.depth,
-                                        filter_size=config.filter, universal=config.universal)
-
-        self.echo_decoder = Decoder(config.emb_dim, hidden_size=config.hidden_dim, num_layers=config.hop,
-                                    num_heads=config.heads,
-                                    total_key_depth=config.depth, total_value_depth=config.depth,
-                                    filter_size=config.filter)
-
-        self.cause_decoder = Decoder(config.emb_dim, hidden_size=config.hidden_dim, num_layers=config.hop,
-                                     num_heads=config.heads,
-                                     total_key_depth=config.depth, total_value_depth=config.depth,
-                                     filter_size=config.filter)
-
-        self.emotion_decoder = Decoder(config.emb_dim, hidden_size=config.hidden_dim, num_layers=config.hop,
-                                       num_heads=config.heads,
-                                       total_key_depth=config.depth, total_value_depth=config.depth,
-                                       filter_size=config.filter)
-
-        self.ori_strategy = nn.Linear(config.hidden_dim, 3, bias=False)
-        self.rep_strategy = nn.Linear(config.hidden_dim, 3, bias=False)
-        self.latent_layer = strategy_CVAE(3, 5)
-
-    def forward(self, dec_input, encoder_outputs, mask, train=False):
-        mask_src, mask_trg = mask
-        echo_logit, _ = self.echo_decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
-        emotion_pre_logit, _ = self.emotion_decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
-        cause_pre_logit, _ = self.cause_decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
-        outputs = torch.stack([echo_logit, emotion_pre_logit, cause_pre_logit], dim=1)
-        mask_tgt = dec_input.data.eq(config.PAD_idx).unsqueeze(1)
-        rep_strategy = F.softmax(self.rep_strategy(encoder_outputs[:, 0]), dim=-1)
-        ori_strategy = F.softmax(self.ori_strategy(self.response_encoder(dec_input[:, :30], mask_tgt[:, :30])[:, 0]),
-                                 dim=-1)
-
-        kld_loss, _ = self.latent_layer(ori_strategy, rep_strategy)
-        if train:
-            pre_logit = torch.mul(ori_strategy.view(-1, 3, 1, 1).expand(outputs.size()), outputs).sum(dim=1)
-        else:
-            pre_logit = torch.mul(rep_strategy.view(-1, 3, 1, 1).expand(outputs.size()), outputs).sum(dim=1)
-        return pre_logit, kld_loss
-
-class Strategy(nn.Module):
+class Wo_Encoder(nn.Module):
     def __init__(self, vocab, decoder_number, model_file_path=None, load_optim=False):
         """
         vocab: a Lang type data, which is defined in data_reader.py
         decoder_number: the number of classes
         """
-        super(Strategy, self).__init__()
+        super(Wo_Encoder, self).__init__()
         self.iter = 0
         self.current_loss = 1000
         self.device = config.device
         self.vocab = vocab
         self.vocab_size = vocab.n_words
 
-        self.embedding = share_embedding(self.vocab, config.pretrain_emb)
+        self.embedding = share_embedding(self.vocab, config.emb_dim, config.PAD_idx, config.pretrain_emb)
         posembedding = torch.FloatTensor(np.load(config.posembedding_path, allow_pickle=True))
         self.causeposembeding = nn.Embedding.from_pretrained(posembedding, freeze=True)
 
-        self.glstm = GLSTM(self.embedding)
+        self.glstm = GLSTM(self.embedding, config.emb_dim, config.hop_num)
 
         self.encoder = Encoder(config.emb_dim, config.hidden_dim, num_layers=config.hop, num_heads=config.heads,
                                total_key_depth=config.depth, total_value_depth=config.depth,
                                filter_size=config.filter, universal=config.universal)
 
-        self.decoder = strategy_decoder()
+        self.decoder = Decoder(config.emb_dim, hidden_size=config.hidden_dim, num_layers=config.hop,
+                               num_heads=config.heads,
+                               total_key_depth=config.depth, total_value_depth=config.depth,
+                               filter_size=config.filter)
+
         self.decoder_key = nn.Linear(config.hidden_dim, decoder_number, bias=False)
         self.generator = Generator(config.hidden_dim, self.vocab_size)
 
@@ -475,11 +388,11 @@ class Strategy(nn.Module):
             self.generator.proj.weight = self.embedding.lut.weight
 
         self.criterion = nn.NLLLoss(ignore_index=config.PAD_idx)
-        if (config.label_smoothing):
+        if config.label_smoothing:
             self.criterion = LabelSmoothing(size=self.vocab_size, padding_idx=config.PAD_idx, smoothing=0.1)
             self.criterion_ppl = nn.NLLLoss(ignore_index=config.PAD_idx)
 
-        if (config.noam):
+        if config.noam:
             optimizer = torch.optim.Adam(self.parameters(), lr=0, weight_decay=config.weight_decay, betas=(0.9, 0.98),
                                          eps=1e-9)
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[config.schedule*i for i in range(4)], gamma=0.1)
@@ -504,6 +417,7 @@ class Strategy(nn.Module):
                     self.scheduler.load_state_dict(state['optimizer'])
                 except AttributeError:
                     pass
+
         self.model_dir = config.save_path
         if not os.path.exists(self.model_dir):
             os.makedirs(self.model_dir)
@@ -513,30 +427,26 @@ class Strategy(nn.Module):
         self.iter = iter
         state = {
             'iter': self.iter,
-            'embedding_dict': self.embedding.state_dict(),
             'encoder_state_dict': self.encoder.state_dict(),
             'cause_encoder_dict': self.glstm.state_dict(),
             'decoder_state_dict': self.decoder.state_dict(),
             'generator_dict': self.generator.state_dict(),
             'decoder_key_state_dict': self.decoder_key.state_dict(),
+            'embedding_dict': self.embedding.state_dict(),
             'optimizer': self.scheduler.state_dict(),
             'current_loss': running_avg_ppl
         }
+
         model_save_path = os.path.join(self.model_dir, 'model_{}_{:.4f}'.format(
             iter, running_avg_ppl))
         self.best_path = model_save_path
         torch.save(state, model_save_path)
 
-    def sampling(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return eps.mul(std).add(mu)
-
-    def train_one_batch(self, batch, train=True):
+    def train_one_batch(self, batch, iter, train=True):
         enc_batch, cause_batch = get_input_from_batch(batch)
         graphs, graph_num = get_graph_from_batch(batch)
         dec_batch, dec_lengths = get_output_from_batch(batch)
-        if (config.noam):
+        if config.noam:
             self.scheduler.optimizer.zero_grad()
         else:
             self.optimizer.zero_grad()
@@ -545,12 +455,8 @@ class Strategy(nn.Module):
         mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
         emb_mak = self.embedding(batch["mask_input"])
         causepos = self.causeposembeding(batch["causepos"])
-        encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mak + causepos, mask_src)
-
-        ## graph processing
-        if torch.sum(graph_num):
-            concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask = graphs
-            triple_repr, cause_repr = self.glstm.comp_cause(concept_ids, relation, head, tail, triple_label)
+        encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mak + causepos,
+                                       mask_src)
 
         ## decode
         sos_token = torch.LongTensor([config.SOS_idx] * enc_batch.size(0)).unsqueeze(1).to(self.device)
@@ -558,44 +464,39 @@ class Strategy(nn.Module):
         mask_trg = dec_batch_shift.data.eq(config.PAD_idx).unsqueeze(1)
         dec_input = self.embedding(dec_batch_shift)
 
+        ## logit and graph processing
         if torch.sum(graph_num):
-            dec_input[:, 0] = dec_input[:, 0] + cause_repr
-
-        ## logit
-        pre_logit, kld_loss = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg), train=True)
-
-        ## CVAE strategy
-
-        logit = self.generator(pre_logit)
-        if torch.sum(graph_num):
+            pre_logit, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
+            logit = self.generator(pre_logit)
+            concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask = graphs
+            triple_repr, _ = self.glstm.comp_cause(concept_ids, relation, head, tail, triple_label)
             gate, cpt_probs_vocab = self.glstm.comp_pointer(pre_logit, concept_label, distance, head, tail, triple_repr,
                                 triple_label, vocab_map, map_mask)
             logit = logit * (1 - gate) + gate * cpt_probs_vocab
 
+        else:
+            pre_logit, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
+            logit = self.generator(pre_logit)
+
         loss = self.criterion(logit.contiguous().view(-1, logit.size(-1)), dec_batch.contiguous().view(-1))
-        loss_bce_program, loss_bce_caz, program_acc = 0, 0, 0
-        loss += kld_loss
-
         # multi-task
-        if config.emo_multitask:
-            # add the loss function of label prediction
-            # q_h = torch.mean(encoder_outputs,dim=1)
-            q_h = encoder_outputs[:, 0]  # the first token of the sentence CLS, shape: (batch_size, 1, hidden_size)
-            logit_prob = self.decoder_key(q_h).to(self.device)  # (batch_size, 1, decoder_num)
-            loss += nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).cuda())
 
-            loss_bce_program = nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).cuda()).item()
-            pred_program = np.argmax(logit_prob.detach().cpu().numpy(), axis=1)
-            program_acc = accuracy_score(batch["program_label"], pred_program)
+        q_h = encoder_outputs[:, 0]  # the first token of the sentence CLS, shape: (batch_size, 1, hidden_size)
+        logit_prob = self.decoder_key(q_h).to(self.device)  # (batch_size, 1, decoder_num)
+        loss += nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).to(self.device))
 
-        if (config.label_smoothing):
+        loss_bce_program = nn.CrossEntropyLoss()(logit_prob, torch.LongTensor(batch['program_label']).to(self.device)).item()
+        pred_program = np.argmax(logit_prob.detach().cpu().numpy(), axis=1)
+        program_acc = accuracy_score(batch["program_label"], pred_program)
+
+        if config.label_smoothing:
             loss_ppl = self.criterion_ppl(logit.contiguous().view(-1, logit.size(-1)),
                                           dec_batch.contiguous().view(-1)).item()
 
-        if (train):
+        if train:
             loss.backward()
             self.scheduler.step()
-        if (config.label_smoothing):
+        if config.label_smoothing:
             return loss_ppl, math.exp(min(loss_ppl, 100)), loss_bce_program, program_acc
         else:
             return loss.item(), math.exp(min(loss.item(), 100)), loss_bce_program, program_acc
@@ -618,11 +519,9 @@ class Strategy(nn.Module):
         encoder_outputs = self.encoder(self.embedding(enc_batch) + emb_mask + causepos,
                                        mask_src)
 
-
         if torch.sum(graph_num):
             concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask = graphs
-            ## graph_encoder
-            triple_repr, cause_repr = self.glstm.comp_cause(concept_ids, relation, head, tail, triple_label)
+            triple_repr, _ = self.glstm.comp_cause(concept_ids, relation, head, tail, triple_label)
 
         ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(self.device)
         mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
@@ -630,17 +529,14 @@ class Strategy(nn.Module):
         for i in range(max_dec_step + 1):
             dec_input = self.embedding(ys)
             if torch.sum(graph_num):
-                dec_input[:, 0] = dec_input[:, 0] + cause_repr
-
-            out, _ = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
-
-            prob = self.generator(out)
-
-            if torch.sum(graph_num):
+                out, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
+                prob = self.generator(out)
                 gate, cpt_probs_vocab = self.glstm.comp_pointer(out, concept_label, distance, head, tail, triple_repr,
                                                             triple_label, vocab_map, map_mask)
                 prob = prob * (1 - gate) + gate * cpt_probs_vocab
-
+            else:
+                out, attn_dist = self.decoder(dec_input, encoder_outputs, (mask_src, mask_trg))
+                prob = self.generator(out)
             _, next_word = torch.max(prob[:, -1], dim=1)
             decoded_words.append(['<EOS>' if ni.item() == config.EOS_idx else self.vocab.index2word[ni.item()] for ni in
                                   next_word.view(-1)])
@@ -675,17 +571,17 @@ class ACT_basic(nn.Module):
     def forward(self, state, inputs, fn, time_enc, pos_enc, max_hop, encoder_output=None, decoding=False):
         # init_hdd
         ## [B, S]
-        halting_probability = torch.zeros(inputs.shape[0],inputs.shape[1]).cuda()
+        halting_probability = torch.zeros(inputs.shape[0],inputs.shape[1]).to(config.device)
         ## [B, S]
-        remainders = torch.zeros(inputs.shape[0],inputs.shape[1]).cuda()
+        remainders = torch.zeros(inputs.shape[0],inputs.shape[1]).to(config.device)
         ## [B, S]
-        n_updates = torch.zeros(inputs.shape[0],inputs.shape[1]).cuda()
+        n_updates = torch.zeros(inputs.shape[0],inputs.shape[1]).to(config.device)
         ## [B, S, HDD]
-        previous_state = torch.zeros_like(inputs).cuda()
+        previous_state = torch.zeros_like(inputs).to(config.device)
 
         step = 0
         # for l in range(self.num_layers):
-        while( ((halting_probability<self.threshold) & (n_updates < max_hop)).byte().any()):
+        while ((halting_probability<self.threshold) & (n_updates < max_hop)).byte().any():
             # as long as there is a True value, the loop continues
             # Add timing signal
             state = state + time_enc[:, :inputs.shape[1], :].type_as(inputs.data)
@@ -720,7 +616,7 @@ class ACT_basic(nn.Module):
             # the remainders when it halted this step
             update_weights = p * still_running + new_halted * remainders
 
-            if(decoding):
+            if decoding:
                 state, _, attention_weight = fn((state,encoder_output,[]))
             else:
                 # apply transformation on the state
@@ -728,15 +624,15 @@ class ACT_basic(nn.Module):
 
             # update running part in the weighted state and keep the rest
             previous_state = ((state * update_weights.unsqueeze(-1)) + (previous_state * (1 - update_weights.unsqueeze(-1))))
-            if(decoding):
-                if(step==0):  previous_att_weight = torch.zeros_like(attention_weight).cuda()      ## [B, S, src_size]
+            if decoding:
+                if(step==0):  previous_att_weight = torch.zeros_like(attention_weight).to(config.device)     ## [B, S, src_size]
                 previous_att_weight = ((attention_weight * update_weights.unsqueeze(-1)) + (previous_att_weight * (1 - update_weights.unsqueeze(-1))))
             ## previous_state is actually the new_state at end of hte loop
             ## to save a line I assigned to previous_state so in the next
             ## iteration is correct. Notice that indeed we return previous_state
             step+=1
 
-        if(decoding):
+        if decoding:
             return previous_state, previous_att_weight, (remainders,n_updates)
         else:
             return previous_state, (remainders,n_updates)

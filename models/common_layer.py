@@ -5,16 +5,22 @@ import torch.nn.functional as F
 import math
 import os
 import pickle
-import config
 from utils.metric import moses_multi_bleu, rouge
+import config
+if config.model == 'multiexpert':
+    from utils.beam_omt_expert import Translator
+elif config.model == 'multihop' or "cause-effect":
+    from utils.beam_out_multihop import Translator
+elif config.model == 'mime':
+    from utils.beam_omt_mime import Translator
+else:
+    from utils.beam_omt import Translator
 
-from utils.beam_omt import Translator
 import pprint
 from tqdm import tqdm
 
 pp = pprint.PrettyPrinter(indent=1)
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
 
 torch.manual_seed(0)
@@ -77,6 +83,7 @@ class EncoderLayer(nn.Module):
         y = self.dropout(x + y)
 
         return y
+
 
 class DecoderLayer(nn.Module):
     """
@@ -153,6 +160,7 @@ class DecoderLayer(nn.Module):
 
         # Return encoder outputs as well to work with nn.Sequential
         return y, encoder_outputs, attention_weight, mask
+
 
 class MultiExpertMultiHeadAttention(nn.Module):
     def __init__(self, num_experts, input_depth, total_key_depth, total_value_depth, output_depth,
@@ -269,6 +277,7 @@ class MultiExpertMultiHeadAttention(nn.Module):
         outputs = self.output_linear(contexts)
 
         return outputs
+
 
 class MultiHeadAttention(nn.Module):
     """
@@ -387,51 +396,162 @@ class MultiHeadAttention(nn.Module):
         # shape: (batch_size, seq_length, output_size)
         return outputs, attetion_weights
 
-class RTHNLayer(nn.Module):
+
+class DecoderLayerContextV(nn.Module):
     """
-    An implementation of the framework in https://arxiv.org/abs/1906.01236
-    Refer Figure 2
+    Represents one Decoder layer of the Transformer Decoder
+    Refer Fig. 1 in https://arxiv.org/pdf/1706.03762.pdf
+    NOTE: The layer normalization step has been moved to the input as per latest version of T2T
     """
-    def __init__(self, input_depth, total_key_depth, total_value_depth, num_heads, output_depth,
-                 program_class, max_doc_len, bias_mask=None, attention_dropout=0.0,
-                 layer_dropout=0.0):
-        super(RTHNLayer, self).__init__()
-        self.program_class = program_class
-        self.max_doc_len = max_doc_len
-        self.output_depth = output_depth
-        self.multi_head_attention = MultiHeadAttention(input_depth, total_key_depth, total_value_depth,
-                        output_depth, num_heads, bias_mask, attention_dropout)
+    def __init__(self, hidden_size, total_key_depth, total_value_depth, filter_size, num_heads,
+                 bias_mask, layer_dropout=0.0, attention_dropout=0.0, relu_dropout=0.0):
+        """
+        Parameters:
+            hidden_size: Hidden size
+            total_key_depth: Size of last dimension of keys. Must be divisible by num_head
+            total_value_depth: Size of last dimension of values. Must be divisible by num_head
+            output_depth: Size last dimension of the final output
+            filter_size: Hidden size of the middle layer in FFN
+            num_heads: Number of attention heads
+            bias_mask: Masking tensor to prevent connections to future elements
+            layer_dropout: Dropout for this layer
+            attention_dropout: Dropout probability after attention (Should be non-zero only during training)
+            relu_dropout: Dropout probability after relu in FFN (Should be non-zero only during training)
+        """
 
-        self.class_lt = nn.Linear(output_depth, program_class)
-        self.pred_lt = nn.Linear(max_doc_len, max_doc_len, bias=False)
-        self.layer_dropout = nn.Dropout(layer_dropout)
+        super(DecoderLayerContextV, self).__init__()
 
-    def forward(self, sen_encode_value, sen_encode, attn_mask=None):
-        self.device = sen_encode_value.device
-        batch_size = sen_encode_value.size(0)
-        pred_zeros = torch.zeros((batch_size, self.max_doc_len, self.max_doc_len)).to(self.device)
-        pred_ones = torch.ones_like(pred_zeros).to(self.device)
-        pred_two = torch.ones_like(pred_zeros).to(self.device).fill_(2.)
-        matrix = (1 - torch.eye(self.max_doc_len).to(self.device)).unsqueeze(0) + pred_zeros
+        self.multi_head_attention_dec = MultiHeadAttention(hidden_size, total_key_depth, total_value_depth,
+                                                       hidden_size, num_heads, bias_mask, attention_dropout)
 
-        y, _ = self.multi_head_attention(sen_encode_value, sen_encode_value, sen_encode, ~attn_mask.unsqueeze(1)) # (batch_size, doc_len, input_depth)
-        y = torch.relu(y) + sen_encode
-        pred = self.class_lt(self.layer_dropout(y.reshape(-1, self.output_depth).to(self.device)))  # (batch_size, doc_len, class)
+        self.multi_head_attention_enc_dec = MultiHeadAttention(hidden_size, total_key_depth, total_value_depth,
+                                                       hidden_size, num_heads, None, attention_dropout)
 
-        pred = torch.softmax(pred * attn_mask.reshape(-1, 1).float(), dim=-1).\
-            reshape(-1, self.max_doc_len, self.program_class)  # (batch_size, doc_len, class)
+        self.positionwise_feed_forward = PositionwiseFeedForward(hidden_size, filter_size, hidden_size,
+                                                                 layer_config='cc', padding = 'left',
+                                                                 dropout=relu_dropout)
+        self.dropout = nn.Dropout(layer_dropout)
+        self.layer_norm_mha_dec = LayerNorm(hidden_size)
+        self.layer_norm_mha_enc = LayerNorm(hidden_size)
+        self.layer_norm_ffn = LayerNorm(hidden_size)
+        # self.layer_norm_end = LayerNorm(hidden_size)
 
-        reg = torch.tensor(0.).to(self.device)
-        for param in self.class_lt.parameters():
-            reg = reg + torch.norm(param)
 
-        pred_label = torch.argmax(pred, dim=-1).reshape(-1, 1, self.max_doc_len).float() # (batch_size, 1, doc_len)
-        pred_label = pred_label * pred_two - pred_ones
-        pred_label = (pred_label + pred_zeros) * matrix
-        pred_label = torch.tanh(self.pred_lt(pred_label.reshape(-1, self.max_doc_len))).reshape(batch_size, self.max_doc_len, self.max_doc_len)  #+ torch.FloatTensor([1e-18, 1e-18]).to(self.device)
-        # pred_label = torch.relu(pred_label)
+    def forward(self, inputs):
+        """
+        NOTE: Inputs is a tuple consisting of decoder inputs and encoder output
+        """
 
-        return y, pred, pred_label, reg # y: (batch_size, doc_len, input_depth); pred: (batch_size, doc_len, program_class)
+        x, encoder_outputs, v, attention_weight, mask = inputs
+        mask_src, dec_mask = mask
+
+        # Layer Normalization before decoder self attention
+        x_norm = self.layer_norm_mha_dec(x)
+
+        # Masked Multi-head attention
+        y, _ = self.multi_head_attention_dec(x_norm, x_norm, x_norm, dec_mask)
+
+        # Dropout and residual after self-attention
+        x = self.dropout(x + y)
+
+        # Layer Normalization before encoder-decoder attention
+        x_norm = self.layer_norm_mha_enc(x)
+
+        # Multi-head encoder-decoder attention
+        y, attention_weight = self.multi_head_attention_enc_dec(x_norm, encoder_outputs, v, mask_src)
+
+        # Dropout and residual after encoder-decoder attention
+        x = self.dropout(x + y)
+
+        # Layer Normalization
+        x_norm = self.layer_norm_ffn(x)
+
+        # Positionwise Feedforward
+        y = self.positionwise_feed_forward(x_norm)
+
+        # Dropout and residual after positionwise feed forward layer
+        y = self.dropout(x + y)
+
+        # y = self.layer_norm_end(y)
+
+        # Return encoder outputs as well to work with nn.Sequential
+        return y, encoder_outputs, v, attention_weight, mask
+
+
+class ComplexEmoAttentionLayer(nn.Module):
+    """
+    Represents one Decoder layer of the Transformer Decoder
+    Refer Fig. 1 in https://arxiv.org/pdf/1706.03762.pdf
+    NOTE: The layer normalization step has been moved to the input as per latest version of T2T
+    """
+
+    def __init__(self, hidden_size, total_key_depth, total_value_depth, filter_size, num_heads,
+                 bias_mask, layer_dropout=0.0, attention_dropout=0.0, relu_dropout=0.0):
+        """
+        Parameters:
+            hidden_size: Hidden size
+            total_key_depth: Size of last dimension of keys. Must be divisible by num_head
+            total_value_depth: Size of last dimension of values. Must be divisible by num_head
+            output_depth: Size last dimension of the final output
+            filter_size: Hidden size of the middle layer in FFN
+            num_heads: Number of attention heads
+            bias_mask: Masking tensor to prevent connections to future elements
+            layer_dropout: Dropout for this layer
+            attention_dropout: Dropout probability after attention (Should be non-zero only during training)
+            relu_dropout: Dropout probability after relu in FFN (Should be non-zero only during training)
+        """
+
+        super(ComplexEmoAttentionLayer, self).__init__()
+
+        self.multi_head_attention_enc_dec = MultiHeadAttention(hidden_size, total_key_depth, total_value_depth,
+                                                               hidden_size, num_heads, None, attention_dropout)
+
+        self.positionwise_feed_forward = PositionwiseFeedForward(hidden_size, filter_size, hidden_size,
+                                                                 layer_config='cc', padding='left',
+                                                                 dropout=relu_dropout)
+        self.dropout = nn.Dropout(layer_dropout)
+        self.layer_norm_mha_dec = LayerNorm(hidden_size)
+        self.layer_norm_mha_enc = LayerNorm(hidden_size)
+        self.layer_norm_ffn = LayerNorm(hidden_size)
+        # self.layer_norm_end = LayerNorm(hidden_size)
+
+    def forward(self, inputs):
+        """
+        NOTE: Inputs is a tuple consisting of decoder inputs and encoder output
+        """
+
+        x, m, m_tilt, attention_weight, mask = inputs
+        m_concat = torch.cat((m, m_tilt), dim=1)
+        if mask is None:
+            mas_src = None
+        else:
+            mask_src = torch.cat((mask, mask), dim = 2)
+
+        # Layer Normalization before decoder self attention
+        x_norm = self.layer_norm_mha_dec(x)
+
+        # Multi-head encoder-decoder attention
+        y, attention_weight = self.multi_head_attention_enc_dec(x_norm, m_concat, m_concat,
+                                                                mask_src)  # Q, K, V
+
+        # Dropout and residual after encoder-decoder attention
+        x = self.dropout(x + y)
+
+        # Layer Normalization
+        x_norm = self.layer_norm_ffn(x)
+
+        # Can try remove this positionwise feedforward
+        # Positionwise Feedforward
+        y = self.positionwise_feed_forward(x_norm)
+
+        # Dropout and residual after positionwise feed forward layer
+        y = self.dropout(x + y)
+
+        # y = self.layer_norm_end(y)
+
+        # Return encoder outputs as well to work with nn.Sequential
+        return y, m_concat, attention_weight, mask
+
 
 class Conv(nn.Module):
     """
@@ -457,6 +577,7 @@ class Conv(nn.Module):
         outputs = self.conv(inputs).permute(0, 2, 1)
 
         return outputs
+
 
 class PositionwiseFeedForward(nn.Module):
     """
@@ -503,6 +624,7 @@ class PositionwiseFeedForward(nn.Module):
 
         return x
 
+
 class LayerNorm(nn.Module):
     # Borrowed from jekbradbury
     # https://github.com/pytorch/pytorch/issues/1959
@@ -517,6 +639,53 @@ class LayerNorm(nn.Module):
         std = x.std(-1, keepdim=True)
         return self.gamma * (x - mean) / (std + self.eps) + self.beta
 
+
+class RTHNLayer(nn.Module):
+    """
+    An implementation of the framework in https://arxiv.org/abs/1906.01236
+    Refer Figure 2
+    """
+    def __init__(self, input_depth, total_key_depth, total_value_depth, num_heads, output_depth,
+                 program_class, bias_mask=None, attention_dropout=0.0,
+                 layer_dropout=0.0):
+        super(RTHNLayer, self).__init__()
+        self.program_class = program_class
+        self.output_depth = output_depth
+        self.multi_head_attention = MultiHeadAttention(input_depth, total_key_depth, total_value_depth,
+                        output_depth, num_heads, bias_mask, attention_dropout)
+
+        self.class_lt = nn.Linear(output_depth, program_class)
+        self.layer_dropout = nn.Dropout(layer_dropout)
+
+    def forward(self, sen_encode_value, sen_encode, attn_mask=None):
+        self.device = sen_encode_value.device
+        batch_size = sen_encode_value.size(0)
+        max_doc_len = sen_encode_value.size(-2)
+        pred_zeros = torch.zeros((batch_size, max_doc_len, max_doc_len)).to(self.device)
+        pred_ones = torch.ones_like(pred_zeros).to(self.device)
+        pred_two = torch.ones_like(pred_zeros).to(self.device).fill_(2.)
+        matrix = (1 - torch.eye(max_doc_len).to(self.device)).unsqueeze(0) + pred_zeros
+
+        y, _ = self.multi_head_attention(sen_encode_value, sen_encode_value, sen_encode, ~attn_mask.unsqueeze(1)) # (batch_size, doc_len, input_depth)
+        y = torch.relu(y) + sen_encode
+        pred = self.class_lt(self.layer_dropout(y.reshape(-1, self.output_depth).to(self.device)))  # (batch_size, doc_len, class)
+
+        pred = torch.softmax(pred * attn_mask.reshape(-1, 1).float(), dim=-1).\
+            reshape(-1, max_doc_len, self.program_class)  # (batch_size, doc_len, class)
+
+        reg = torch.tensor(0.).to(self.device)
+        for param in self.class_lt.parameters():
+            reg = reg + torch.norm(param)
+
+        pred_label = torch.argmax(pred, dim=-1).reshape(-1, 1, max_doc_len).float() # (batch_size, 1, doc_len)
+        pred_label = pred_label * pred_two - pred_ones
+        pred_label = (pred_label + pred_zeros) * matrix
+        pred_label = torch.tanh(pred_label.reshape(-1, max_doc_len)).reshape(batch_size, max_doc_len, max_doc_len)  #+ torch.FloatTensor([1e-18, 1e-18]).to(self.device)
+        # pred_label = torch.relu(pred_label)
+
+        return y, pred, pred_label, reg # y: (batch_size, doc_len, input_depth); pred: (batch_size, doc_len, program_class)
+
+
 def _gen_bias_mask(max_length):
     """
     Generates bias values (-Inf) to mask future timesteps during attention
@@ -526,6 +695,7 @@ def _gen_bias_mask(max_length):
     # (max_length, max_length)
     return torch_mask.unsqueeze(0).unsqueeze(1)
     # (1, 1, max_length, max_length)
+
 
 def _gen_timing_signal(length, channels, min_timescale=1.0, max_timescale=1.0e4):
     """
@@ -548,6 +718,7 @@ def _gen_timing_signal(length, channels, min_timescale=1.0, max_timescale=1.0e4)
 
     return torch.from_numpy(signal).type(torch.FloatTensor)
 
+
 def _get_attn_subsequent_mask(size):
     """
     Get an attention mask to avoid using the subsequent info.
@@ -561,7 +732,8 @@ def _get_attn_subsequent_mask(size):
     subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
     subsequent_mask = torch.from_numpy(subsequent_mask)
 
-    return subsequent_mask.to(config.device)
+    return subsequent_mask.to('cuda')
+
 
 class OutputLayer(nn.Module):
     """
@@ -576,6 +748,7 @@ class OutputLayer(nn.Module):
 
     def loss(self, hidden, labels):
         raise NotImplementedError('Must implement {}.loss'.format(self.__class__.__name__))
+
 
 class SoftmaxOutputLayer(OutputLayer):
     """
@@ -594,6 +767,7 @@ class SoftmaxOutputLayer(OutputLayer):
         log_probs = F.log_softmax(logits, -1)
         return F.nll_loss(log_probs.view(-1, self.output_size), labels.view(-1))
 
+
 def position_encoding(sentence_size, embedding_dim):
     encoding = np.ones((embedding_dim, sentence_size), dtype=np.float32)
     ls = sentence_size + 1
@@ -605,6 +779,7 @@ def position_encoding(sentence_size, embedding_dim):
     # Make position encoding of time words identity to avoid modifying them
     # encoding[:, -1] = 1.0
     return np.transpose(encoding)
+
 
 def gen_embeddings(vocab):
     """
@@ -631,6 +806,7 @@ def gen_embeddings(vocab):
         pickle.dump(embeddings, open(config.emb_path, 'wb'))
     return embeddings
 
+
 class Embeddings(nn.Module):
     def __init__(self, vocab, d_model, padding_idx=None):
         super(Embeddings, self).__init__()
@@ -640,13 +816,15 @@ class Embeddings(nn.Module):
     def forward(self, x):
         return self.lut(x) * math.sqrt(self.d_model)
 
-def share_embedding(vocab, pretrain=True):
-    embedding = Embeddings(vocab.n_words, config.emb_dim, padding_idx=config.PAD_idx)
+
+def share_embedding(vocab, emb_dim, PAD_idx, pretrain=True):
+    embedding = Embeddings(vocab.n_words, emb_dim, padding_idx=PAD_idx)
     if (pretrain):
         pre_embedding = gen_embeddings(vocab)
         embedding.lut.weight.data.copy_(torch.FloatTensor(pre_embedding))
         embedding.lut.weight.data.requires_grad = True
     return embedding
+
 
 class LabelSmoothing(nn.Module):
     "Implement label smoothing."
@@ -671,6 +849,7 @@ class LabelSmoothing(nn.Module):
             true_dist.index_fill_(0, mask.squeeze(), 0.0)
         self.true_dist = true_dist
         return self.criterion(x, true_dist)
+
 
 class NoamOpt:
     "Optim wrapper that implements rate."
@@ -704,15 +883,6 @@ class NoamOpt:
                (self.model_size ** (-0.5) *
                 min(step ** (-0.5), step * self.warmup ** (-1.5)))
 
-def get_attn_key_pad_mask(seq_k, seq_q):
-    ''' For masking out the padding part of key sequence. '''
-
-    # Expand to fit the shape of key query attention matrix.
-    len_q = seq_q.size(1)
-    padding_mask = seq_k.eq(config.PAD_idx)
-    padding_mask = padding_mask.unsqueeze(1).expand(-1, len_q, -1)  # b x lq x lk
-
-    return padding_mask
 
 def get_graph_from_batch(batch):
     concept_ids = batch["concept_ids"]
@@ -722,12 +892,13 @@ def get_graph_from_batch(batch):
     head = batch["heads"]
     tail = batch["tails"]
     triple_label = batch["triple_label"]
-    vocab_map = batch["vocab_map"].to(config.device)
-    map_mask = batch["map_mask"].to(config.device)
-    graph_num = torch.LongTensor(batch["graph_num"]).to(config.device)
+    vocab_map = batch["vocab_map"].to('cuda')
+    map_mask = batch["map_mask"].to('cuda')
+    graph_num = torch.LongTensor(batch["graph_num"]).to('cuda')
     if relation.size(-1) == 0:
-        graph_num = torch.LongTensor([0]).to(config.device)
+        graph_num = torch.LongTensor([0]).to('cuda')
     return (concept_ids, concept_label, distance, relation, head, tail, triple_label, vocab_map, map_mask), graph_num
+
 
 def get_input_from_batch(batch):
     enc_batch = batch["input_batch"]
@@ -735,13 +906,17 @@ def get_input_from_batch(batch):
 
     return enc_batch, cause_batch
 
+
 def get_output_from_batch(batch):
     dec_batch = batch["target_batch"]
-
     dec_lens_var = batch["target_lengths"]
-    max_dec_len = max(dec_lens_var)
+    fake_target = batch["targets_batch"]
+    fake_lengths = batch["targets_lengths"] - 1
+    dec_fakes = (fake_target, fake_lengths)
+    # max_dec_len = max(dec_lens_var)
 
-    return dec_batch, dec_lens_var
+    return dec_batch, dec_lens_var, dec_fakes
+
 
 def sequence_mask(sequence_length, max_len=None):
     if max_len is None:
@@ -756,7 +931,8 @@ def sequence_mask(sequence_length, max_len=None):
                          .expand_as(seq_range_expand))
     return seq_range_expand < seq_length_expand
 
-def write_config():
+
+def write_config(config):
     if (not config.test):
         if not os.path.exists(config.save_path):
             os.makedirs(config.save_path)
@@ -768,6 +944,7 @@ def write_config():
                     the_file.write("--{} ".format(k))
                 else:
                     the_file.write("--{} {} ".format(k, v))
+
 
 def print_custum(emotion, dial, ref, hyp_g, hyp_b):
     print("emotion:{}".format(emotion))
@@ -782,29 +959,8 @@ def print_custum(emotion, dial, ref, hyp_g, hyp_b):
     print("----------------------------------------------------------------------")
     print("----------------------------------------------------------------------")
 
-def plot_ptr_stats(model):
-    stat_dict = model.generator.stats
-    a = np.mean(stat_dict["a"])
-    a_1_g = np.mean(stat_dict["a_1_g"])
-    a_1_g_1 = np.mean(stat_dict["a_1_g_1"])
-    a_STD = np.std(stat_dict["a"])
-    a_1_g_STD = np.std(stat_dict["a_1_g"])
-    a_1_g_1_STD = np.std(stat_dict["a_1_g_1"])
-    name = ['Vocab', 'Dialg', 'DB']
-    x_pos = np.arange(3)
-    CTEs = [a, a_1_g, a_1_g_1]
-    error = [a_STD, a_1_g_STD, a_1_g_1_STD]
-    fig, ax = plt.subplots()
-    ax.bar(x_pos, CTEs, yerr=error, align='center', alpha=0.5, ecolor='black', capsize=10)
-    ax.set_ylabel('Distribution weights')
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(name)
-    ax.yaxis.grid(True)
-    # Save the figure and show
-    plt.tight_layout()
-    plt.savefig(config.save_path + 'bar_plot_with_error_bars.png')
 
-def evaluate(model, data, ty='valid', max_dec_step=30, save=False):
+def evaluate(model, data, dataset, save_path, ty='valid', max_dec_step=30, save=False):
     emotion_lst, batch_lst, ref, hyp_g, hyp_b = [], [], [], [], []
     if ty == "test":
         print("testing generation:")
@@ -815,7 +971,7 @@ def evaluate(model, data, ty='valid', max_dec_step=30, save=False):
     acc = []
     pbar = tqdm(enumerate(data), total=len(data))
     for j, batch in pbar:
-        loss, ppl, bce_prog, acc_prog = model.train_one_batch(batch, train=False)
+        loss, ppl, bce_prog, acc_prog = model.train_one_batch(batch, j, train=False)
         l.append(loss)
         p.append(ppl)
         bce.append(bce_prog)
@@ -827,7 +983,7 @@ def evaluate(model, data, ty='valid', max_dec_step=30, save=False):
                 emotion_lst.append(batch["program_txt"][i])
 
                 batch_lst.append([" ".join(s) for s in
-                                batch['input_txt'][i]] if config.dataset == "empathetic_dialogues" else " ".join(
+                                batch['input_txt'][i]] if dataset == "empathetic_dialogues" else " ".join(
                                 batch['input_txt'][i]))
                 rf = " ".join([ele for lis in batch["target_txt"][i] for ele in lis])
                 hyp_g.append(greedy_sent)
@@ -835,7 +991,7 @@ def evaluate(model, data, ty='valid', max_dec_step=30, save=False):
                 ref.append(rf)
                 print_custum(emotion=batch["program_txt"][i],
                              dial=[" ".join(s) for s in
-                                batch['input_txt'][i]] if config.dataset == "empathetic_dialogues" else " ".join(
+                                batch['input_txt'][i]] if dataset == "empathetic_dialogues" else " ".join(
                                 batch['input_txt'][i]),
                              ref=rf,
                              hyp_g=greedy_sent,
@@ -848,11 +1004,13 @@ def evaluate(model, data, ty='valid', max_dec_step=30, save=False):
         hyp_g_pd = pd.DataFrame(hyp_g)
         hyp_b_pd = pd.DataFrame(hyp_b)
         ref_pd = pd.DataFrame(ref)
-        emotion_lst.to_csv(config.save_path+'test/emotions.csv', index=False, header=False)
-        batch_lst.to_csv(config.save_path+'test/batch.csv', index=False, header=False)
-        hyp_g_pd.to_csv(config.save_path+'test/reply_greedy.csv', index=False, header=False)
-        hyp_b_pd.to_csv(config.save_path+'test/reply_beam.csv', index=False, header=False)
-        ref_pd.to_csv(config.save_path+'test/reply_true.csv', index=False, header=False)
+        if not os.path.exists(config.save_path + 'test/'):
+            os.mkdir(config.save_path + 'test/')
+        emotion_lst.to_csv(save_path+'test/emotions.csv', index=False, header=False)
+        batch_lst.to_csv(save_path+'test/batch.csv', index=False, header=False)
+        hyp_g_pd.to_csv(save_path+'test/reply_greedy.csv', index=False, header=False)
+        hyp_b_pd.to_csv(save_path+'test/reply_beam.csv', index=False, header=False)
+        ref_pd.to_csv(save_path+'test/reply_true.csv', index=False, header=False)
 
     loss = np.mean(l)
     bce = np.mean(bce)
